@@ -1,0 +1,14 @@
+# Captures and recordings: contain GPS location, camera images and network traffic
+capture_*/
+stream_*/
+probe_*/
+*.pcap
+*.pcapng
+*.h264
+*.mp4
+*.MP4
+
+# Python / macOS
+__pycache__/
+*.pyc
+.DS_Store
