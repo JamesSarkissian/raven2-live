@@ -222,7 +222,24 @@ PAGE = """<!doctype html>
 #att{bottom:10px;left:10px;font-size:11px}
 #att .v{font-size:12px;margin-right:6px}
 #demo{color:#111;background:var(--warn);font-weight:700;font-size:10px;letter-spacing:.06em;border-radius:4px;padding:1px 5px}
-#nodata{top:44px;left:10px;color:var(--dim);font-size:11px}
+#nodata{top:10px;left:50%;transform:translateX(-50%);color:var(--dim);font-size:11px;white-space:nowrap}
+/* preflight checklist: a small pill that expands into the list */
+#pf{top:40px;left:10px;padding:0;overflow:hidden;max-width:calc(100% - 20px)}
+#pfhead{display:flex;align-items:center;gap:8px;padding:5px 9px;cursor:pointer;user-select:none;font-size:12px}
+#pfhead .v{font-size:12px}
+#pf.ready #pfcount{color:var(--ok)}
+#pflist{list-style:none;margin:0;padding:2px 9px 8px;display:none;width:250px}
+#pf.open #pflist{display:block}
+#pflist li{display:flex;align-items:center;gap:7px;padding:3px 0;font-size:12px;color:var(--dim)}
+#pflist li.done{color:var(--fg)}
+#pflist .box{width:14px;height:14px;flex:none;border-radius:4px;border:1.5px solid #4a5463;display:flex;align-items:center;justify-content:center;font-size:10px}
+#pflist li.done .box{background:var(--ok);border-color:var(--ok);color:#0b0d10}
+#pflist li.warn .box{background:var(--warn);border-color:var(--warn)}
+#pflist li.manual{cursor:pointer}
+#pflist li.manual:hover{color:var(--fg)}
+#pflist .tag{margin-left:auto;font-size:10px;color:var(--dim)}
+#pfreset{margin:4px 0 0;font-size:11px;padding:3px 7px}
+
 #state{font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;border-radius:4px;padding:1px 5px;background:#2a3340;color:var(--dim)}
 #state.armed{background:var(--bad);color:#fff}#state.landing{background:var(--warn);color:#111}
 #wrap.stale .hud .v,#wrap.stale #tr{opacity:.45}
@@ -231,7 +248,7 @@ PAGE = """<!doctype html>
 #wrap.active #ctl{opacity:1}
 button{background:#1f2630;color:var(--fg);border:1px solid #2e3744;border-radius:6px;padding:5px 9px;font:inherit;font-size:12px;cursor:pointer}
 button:hover{background:#2a3340}
-@media (max-width:560px){#tr{top:auto;bottom:62px;right:10px}#att{bottom:62px}.cell{padding:1px 5px}.cell .v{font-size:13px}.k{font-size:9px}#fps{display:none}}
+@media (max-width:560px){#pflist{width:220px}#tr{top:auto;bottom:62px;right:10px}#att{bottom:62px}.cell{padding:1px 5px}.cell .v{font-size:13px}.k{font-size:9px}#fps{display:none}}
 </style></head><body>
 <div id=wrap>
   <img id=video src="/stream.mjpg" alt="Live drone camera">
@@ -252,6 +269,10 @@ button:hover{background:#2a3340}
     <div class=cell id=c_hdg><div class=k>Hdg</div><span class=v id=hdg>—</span></div>
   </div>
   <div class=hud id=att><span class=k>R</span> <span class=v id=roll>—</span><span class=k>P</span> <span class=v id=pitch>—</span><span class=k>Y</span> <span class=v id=yaw>—</span></div>
+  <div class=hud id=pf>
+    <div id=pfhead title="Preflight checklist"><span class=k>Preflight</span><span class=v id=pfcount></span><span id=pfarrow class=k>▾</span></div>
+    <ul id=pflist></ul>
+  </div>
   <div class=hud id=ctl><button id=units>ft</button><button id=snap>Snapshot</button><button id=full>Full screen</button></div>
 </div>
 <script>
@@ -289,7 +310,67 @@ function render(s){
   $('lon').textContent=t.lon==null?'—':Math.abs(t.lon).toFixed(6)+'° '+(t.lon>=0?'E':'W');
   $('sats').textContent=t.sats==null?'':'· '+t.sats+' sats'+(t.gps_fix===false?' · no fix':'');
   setv('roll',deg(t.roll_deg));setv('pitch',deg(t.pitch_deg));setv('yaw',deg(t.yaw_deg));
+  pfRender(s);
 }
+// ---- preflight checklist -------------------------------------------------
+// auto: confirmed live from drone data; manual: tick when done (remote has no data link to us)
+const PF=[
+ {id:'power', label:'Drone powered on', auto:s=>s.connected||(s.telemetry_age!=null&&s.telemetry_age<3)},
+ {id:'remote',label:'Remote on (beep)'},
+ {id:'wifi',  label:'Wi-Fi connected', auto:s=>s.connected},
+ {id:'gyro',  label:'Gyro calibration (hold 2 s)'},
+ {id:'compass',label:'Compass calibration (hold 2 s)'},
+ {id:'hturns',label:'Rotate horizontally 3×', turns:true},
+ {id:'vturns',label:'Rotate vertically 3×'},
+ {id:'ground',label:'On open ground, GPS searching', auto:s=>s.telemetry.sats!=null&&s.telemetry_age!=null&&s.telemetry_age<3},
+ {id:'gps',   label:'GPS locked', auto:s=>s.telemetry.gps_fix===true&&s.telemetry.sats>=6&&s.telemetry_age<3},
+ {id:'bat',   label:'Battery 30% or more', auto:s=>s.telemetry.battery_pct!=null&&s.telemetry.battery_pct>=30, warnOnly:true},
+];
+const pfDone={}; let pfOpen=true, pfWasReady=false, pfWasUnlocked=false, turns=0, lastYaw=null, last={};
+function pfReset(){for(const k in pfDone)delete pfDone[k];turns=0;lastYaw=null;pfOpen=true;pfWasReady=false;pfRender(last);}
+function pfTrackTurns(t){
+  // count horizontal turns from heading once compass calibration is ticked
+  if(!pfDone.compass||t.yaw_deg==null){lastYaw=null;return;}
+  if(lastYaw!=null){let d=t.yaw_deg-lastYaw;if(d>180)d-=360;if(d<-180)d+=360;turns+=Math.abs(d)/360;}
+  lastYaw=t.yaw_deg;
+  if(turns>=3)pfDone.hturns=true;
+}
+function pfState(item,s){
+  if(item.auto)return item.auto(s)?'done':(item.warnOnly&&s.telemetry.battery_pct!=null?'warn':'');
+  return pfDone[item.id]?'done':'';
+}
+function pfRender(s){
+  if(!s.telemetry)return;
+  last=s; pfTrackTurns(s.telemetry);
+  const ul=$('pflist');
+  if(!ul.children.length){   // build once; later renders only update, so clicks are never lost
+    for(const item of PF){
+      const li=document.createElement('li'); li.className=item.auto?'':'manual';
+      li.innerHTML='<span class=box></span><span></span><span class=tag></span>';
+      li.children[1].textContent=item.label;
+      if(!item.auto)li.onclick=()=>{pfDone[item.id]=!pfDone[item.id];if(item.id==='compass'){turns=0;lastYaw=null;}pfRender(last);};
+      ul.appendChild(li); item.li=li;
+    }
+    const b=document.createElement('button');b.id='pfreset';b.textContent='Reset checklist';b.onclick=pfReset;ul.appendChild(b);
+  }
+  let n=0;
+  for(const item of PF){
+    const st=pfState(item,s); if(st==='done')n++;
+    item.li.className=st+(item.auto?'':' manual');
+    item.li.children[0].textContent=st==='done'?'✓':st==='warn'?'!':'';
+    item.li.children[2].textContent=item.auto?'auto':(item.turns&&!pfDone.hturns?(pfDone.compass?turns.toFixed(1)+' / 3':'after compass'):'tap');
+  }
+  const ready=n===PF.length;
+  $('pfcount').textContent=ready?'Ready':n+'/'+PF.length;
+  $('pf').classList.toggle('ready',ready);
+  // fold away once ready or when motors unlock, so it never covers the video in flight
+  const unlocked=s.telemetry.state==='Unlocked';
+  if((ready&&!pfWasReady)||(unlocked&&!pfWasUnlocked))pfOpen=false;
+  pfWasReady=ready;pfWasUnlocked=unlocked;
+  $('pf').classList.toggle('open',pfOpen);
+  $('pfarrow').textContent=pfOpen?'▴':'▾';
+}
+$('pfhead').onclick=()=>{pfOpen=!pfOpen;pfRender(last);};
 async function poll(){
   try{render(await (await fetch('/status',{cache:'no-store'})).json());}
   catch(e){$('link').className='';$('fps').textContent='viewer stopped';}

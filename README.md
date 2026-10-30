@@ -20,6 +20,12 @@ Flight always stays on the physical remote.
 3. Double-click `Raven 2 Live.command` (or run `./live_viewer.py`) and type `y`.
 4. The overlay opens at http://localhost:8765. Ctrl+C or closing Terminal sends *stop stream*.
 
+A **Preflight** checklist (top left) follows the takeoff routine: power, remote, Wi-Fi,
+gyro and compass calibration, 3 horizontal and 3 vertical turns, GPS search and lock,
+battery. Steps the drone reports are ticked automatically; horizontal turns are counted
+from the heading after the compass step is ticked; the rest are tapped by hand. It folds
+away when everything is ready or the motors unlock.
+
 `./live_viewer.py --demo` previews the overlay with simulated values; `--no-telemetry` is video only.
 
 ## Files
