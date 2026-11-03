@@ -35,7 +35,16 @@ away when everything is ready or the motors unlock.
   Video and flight data share Unix timestamps, so every frame has a position.
 - The **flight map** (top right, click to enlarge) draws this flight's path, home (H),
   the drone and its heading, and earlier flights in grey to show ground already covered.
-  It has no street map, because the drone's Wi-Fi has no internet.
+- **Recordings** (top left in the live view) opens the recordings page in a new tab: a list
+  of flights by date and time, and a player with video, flight data and a **satellite or
+  street map** where the drone moves along its path in time with the video. It has
+  play/pause, a timeline, 0.5–4× speed, Space/←/→ keys, a Google Maps button for the
+  current position, and KML/GeoJSON downloads. Without the drone, double-click
+  `Raven 2 Recordings.command` (http://localhost:8767/player); it never contacts the drone.
+- When the Mac has internet (for example iPhone USB tethering while on the drone's Wi-Fi),
+  the live map switches to **satellite imagery** that follows the drone (⤢ enlarges it,
+  plus a Google Maps button). Without internet it falls back to the plain map.
+  Imagery: Esri World Imagery; streets: OpenStreetMap.
 - `./live_viewer.py --replay recordings/<name> [--speed 2] [--loop]` plays a recording
   through the viewer without connecting to the drone.
 - `./fake_drone.py FRAMES_DIR [UDP_TEXT]` imitates the drone on this Mac for testing:
@@ -55,6 +64,7 @@ away when everything is ready or the motors unlock.
 | `udp_parse.py` | Reads `tcpdump -x` text for analysis |
 | `recorder.py` | Flight recorder, replay and GPS track |
 | `fake_drone.py` | Imitates the drone locally for testing |
+| `player_page.py` | Recordings page (player and satellite map) |
 
 Captures and recordings (`capture_*/`, `stream_*/`, `probe_*/`, `recordings/`) are git-ignored: they contain
 GPS location and camera images.

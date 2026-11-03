@@ -15,6 +15,7 @@ import datetime
 import json
 import math
 import os
+import re
 import threading
 import time
 
@@ -310,3 +311,84 @@ class Replay(threading.Thread):
         video.close()
         self.cam.connected = False
         self.cam.error = "replay finished"
+
+
+# ---- recordings library (browsing and playback in the viewer) ----------------
+
+def recording_folder(root, name):
+    """Folder for a recording name, or None. Names are checked so a request
+    can never reach outside the recordings folder."""
+    if not re.fullmatch(r"\d{8}_\d{6}", name or ""):
+        return None
+    folder = os.path.join(root, name)
+    return folder if os.path.isfile(os.path.join(folder, "frames.csv")) else None
+
+
+def list_recordings(root):
+    """Newest first, with what the list in the viewer shows."""
+    out = []
+    if not os.path.isdir(root):
+        return out
+    for name in sorted(os.listdir(root), reverse=True):
+        folder = recording_folder(root, name)
+        if not folder:
+            continue
+        meta = {}
+        try:
+            with open(os.path.join(folder, "meta.json")) as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            pass    # still being recorded, or the viewer was killed
+        start = meta.get("start") or time.mktime(time.strptime(name, "%Y%m%d_%H%M%S"))
+        out.append({"name": name, "start": start,
+                    "duration": round(meta["stop"] - start, 1) if meta.get("stop") else None,
+                    "frames": meta.get("frames"), "length_m": meta.get("track_length_m"),
+                    "mb": round(os.path.getsize(os.path.join(folder, "video.mjpg")) / 1e6, 1),
+                    "complete": bool(meta)})
+    return out
+
+
+def recording_data(folder, max_rate=10.0):
+    """Frame times, flight data (at most max_rate rows per second) and the path."""
+    with open(os.path.join(folder, "frames.csv")) as f:
+        frames = [float(r["t"]) for r in csv.DictReader(f)]
+    rows, fields, last = [], [], -1.0
+    with open(os.path.join(folder, "telemetry.csv")) as f:
+        reader = csv.reader(f)
+        header = next(reader, ["t"])
+        fields = header[1:]
+        for r in reader:
+            t = float(r[0])
+            if t - last >= 1.0 / max_rate:
+                rows.append([t] + [_parse(v) for v in r[1:]])
+                last = t
+    track, home = [], None
+    path = os.path.join(folder, "track.geojson")
+    if os.path.exists(path):
+        with open(path) as f:
+            for feat in json.load(f).get("features", []):
+                g = feat["geometry"]
+                if g["type"] == "LineString":
+                    track = [[c[1], c[0]] for c in g["coordinates"]]
+                elif feat["properties"].get("name") == "Home":
+                    home = [g["coordinates"][1], g["coordinates"][0]]
+    return {"name": os.path.basename(folder), "frames": frames, "fields": fields,
+            "rows": rows, "track": track, "home": home}
+
+
+_index_cache = {}
+
+
+def frame_bytes(folder, i):
+    """JPEG bytes of frame i, read straight out of video.mjpg."""
+    idx = _index_cache.get(folder)
+    if idx is None:
+        with open(os.path.join(folder, "frames.csv")) as f:
+            idx = [(int(r["offset"]), int(r["size"])) for r in csv.DictReader(f)]
+        if os.path.exists(os.path.join(folder, "meta.json")):
+            _index_cache[folder] = idx     # only cache finished recordings
+    if not 0 <= i < len(idx):
+        return None
+    with open(os.path.join(folder, "video.mjpg"), "rb") as f:
+        f.seek(idx[i][0])
+        return f.read(idx[i][1])

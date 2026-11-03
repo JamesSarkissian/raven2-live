@@ -36,7 +36,9 @@ from stream_test import (CMD_HEARTBEAT, CMD_RET_STREAM, DRONE_IP, HDR_LEN,
                          HEARTBEAT, HEARTBEAT_EVERY, MAGIC, START, STOP,
                          VIDEO_PORT, recv_exact)
 import telemetry as tm
-from recorder import FlightLog, Replay, Track, past_tracks, valid_fix
+from player_page import PLAYER_PAGE
+from recorder import (FlightLog, Replay, Track, frame_bytes, list_recordings,
+                      past_tracks, recording_data, recording_folder, valid_fix)
 
 HTTP_PORT = 8765
 TELEMETRY_FIELDS = ("battery_pct", "battery_v", "alt_m", "dist_m",
@@ -66,6 +68,7 @@ class Camera(threading.Thread):
         self.track = Track()    # this session's flight path for the live map
         self.log = None         # FlightLog when recording is possible
         self.replay = None      # recording name when replaying
+        self.library = False    # recordings-only mode: no drone at all
         self._sock = None
 
     def run(self):
@@ -220,6 +223,7 @@ PAGE = """<!doctype html>
 <html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Raven 2 Live</title>
+<link rel=stylesheet href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
 :root{--bg:#0b0d10;--panel:rgba(8,10,14,.55);--fg:#eef1f5;--dim:#9aa4b2;--ok:#3ddc84;--warn:#ffb020;--bad:#ff5c5c}
 *{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:13px/1.25 -apple-system,system-ui,sans-serif}
@@ -279,8 +283,16 @@ PAGE = """<!doctype html>
 #rec.on:before{content:"● ";animation:blink 1s steps(2) infinite}
 @keyframes blink{50%{opacity:0}}
 /* flight map: small in the corner, click to enlarge */
-#map{top:62px;right:10px;padding:0;overflow:hidden;cursor:pointer;line-height:0}
-#mapc{display:block}
+#map{top:62px;right:10px;padding:0;overflow:hidden;line-height:0}
+#mapc{display:block;cursor:pointer}
+#lmapLive{background:#1a1f27}
+#lmapLive .leaflet-control-attribution{font-size:8px;line-height:1.2}
+#mapbtns{position:absolute;top:4px;right:4px;z-index:600;display:flex;gap:3px;line-height:1}
+#mapbtns button,#mapbtns a{background:rgba(20,25,32,.85);color:var(--fg);border:1px solid #2e3744;border-radius:5px;padding:2px 6px;font-size:11px;cursor:pointer;text-decoration:none}
+.darrow{width:0;height:0;border-left:7px solid transparent;border-right:7px solid transparent;border-bottom:18px solid #fff;filter:drop-shadow(0 0 2px #000);transform-origin:50% 60%}
+.dhome{background:var(--warn);color:#111;font:700 9px system-ui;border-radius:50%;line-height:14px;text-align:center;border:2px solid #111}
+#recs{font-size:10px;font-weight:700;letter-spacing:.06em;border-radius:4px;padding:1px 6px;background:#2a3340;color:var(--dim);text-decoration:none;text-transform:uppercase}
+#recs:hover{color:var(--fg)}
 /* controls appear on mouse move */
 #ctl{bottom:10px;right:10px;display:flex;gap:6px;opacity:0;transition:opacity .25s}
 #wrap.active #ctl{opacity:1}
@@ -296,11 +308,13 @@ button:hover{background:#2a3340}
     <span id=bat class=na title="Battery"><span id=batbar><div id=batfill></div></span><span class=v id=batv>—</span></span>
     <span id=state title="Motor state" hidden></span>
     <button id=rec title="Record video, flight data and GPS path (R)" hidden>REC</button>
+    <a id=recs href="/player" target=_blank rel=noopener title="Browse and play past recordings">Recordings</a>
     <span id=demo title="Simulated values, not from the drone" hidden>DEMO</span>
   </div>
   <div class=hud id=nodata>No flight data from the drone yet</div>
   <div class=hud id=tr><span class=k>GPS <span id=sats></span></span><br><span id=lat>—</span><br><span id=lon>—</span></div>
-  <div class=hud id=map title="Flight map: click to enlarge"><canvas id=mapc width=170 height=128></canvas></div>
+  <div class=hud id=map><canvas id=mapc width=170 height=128 title="Flight map: click to enlarge"></canvas><div id=lmapLive hidden></div>
+    <div id=mapbtns><button id=mapsize title="Enlarge map">⤢</button><a id=gmapsLive target=_blank rel=noopener title="Open the drone's position in Google Maps" hidden>Google Maps</a></div></div>
   <div class=hud id=strip>
     <div class=cell id=c_alt><div class=k>Alt</div><span class=v id=alt>—</span></div>
     <div class=cell id=c_dist><div class=k>Dist</div><span class=v id=dist>—</span></div>
@@ -434,7 +448,11 @@ document.addEventListener('keydown',e=>{if((e.key==='r'||e.key==='R')&&!$('rec')
 let mapBig=false, mapData=null;
 const NICE=[1,2,5,10,20,50,100,200,500,1000,2000,5000];
 function drawMap(){
-  const c=$('mapc'), small=innerWidth<560, W=mapBig?Math.min(460,innerWidth-20):(small?120:170), H=Math.round(W*.75);
+  const d0=mapData;
+  $('gmapsLive').hidden=!(d0&&d0.drone);
+  if(d0&&d0.drone)$('gmapsLive').href='https://www.google.com/maps/search/?api=1&query='+d0.drone.lat+','+d0.drone.lon;
+  if(lmap)return liveMapUpdate();
+  const c=$('mapc'), [W,H]=mapSize();
   const dpr=devicePixelRatio||1;
   if(c.width!==Math.round(W*dpr)){c.width=Math.round(W*dpr);c.height=Math.round(H*dpr);c.style.width=W+'px';c.style.height=H+'px';}
   const g=c.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
@@ -464,8 +482,42 @@ function drawMap(){
   g.strokeStyle='#eef1f5';g.lineWidth=2;g.beginPath();g.moveTo(6,H-8);g.lineTo(6+len,H-8);g.stroke();
   g.font='10px system-ui';g.fillStyle='#eef1f5';g.fillText(m>=1000?m/1000+' km':m+' m',10+len,H-5);
 }
+function mapSize(){const small=innerWidth<560;let W=mapBig?Math.min(460,innerWidth-20):(lmap?(small?150:230):(small?120:170));return [W,Math.round(W*.75)];}
 async function pollMap(){try{mapData=await (await fetch('/map',{cache:'no-store'})).json();}catch(e){mapData=null;}drawMap();}
-$('map').onclick=()=>{mapBig=!mapBig;drawMap();};
+function toggleMapSize(){mapBig=!mapBig;$('mapsize').textContent=mapBig?'⤡':'⤢';if(lmap){const [W,H]=mapSize();const el=$('lmapLive');el.style.width=W+'px';el.style.height=H+'px';lmap.invalidateSize();}drawMap();}
+$('mapc').onclick=toggleMapSize; $('mapsize').onclick=toggleMapSize;
+// Satellite map when the Mac has internet (e.g. iPhone USB tethering); plain map otherwise.
+let lmap=null, lml={}, lmFollow=0, lmPast=-1;
+function liveMapTry(){
+  if(lmap||!window.L)return;
+  const el=$('lmapLive'); el.hidden=false; const [W,H]=[mapBig?Math.min(460,innerWidth-20):(innerWidth<560?150:230)].map(w=>[w,Math.round(w*.75)])[0];
+  el.style.width=W+'px';el.style.height=H+'px';
+  const m=L.map(el,{zoomControl:false,attributionControl:true}).setView([0,0],18);
+  const tiles=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:21,maxNativeZoom:19,attribution:'Imagery © Esri'}).addTo(m);
+  let ok=false;
+  tiles.once('tileload',()=>{ok=true;lmap=m;$('mapc').style.display='none';
+    lml.past=L.layerGroup().addTo(m);lml.track=L.polyline([],{color:'#38bdf8',weight:3}).addTo(m);
+    lml.home=L.marker([0,0],{icon:L.divIcon({className:'dhome',html:'H',iconSize:[14,14]})});
+    lml.drone=L.marker([0,0],{icon:L.divIcon({className:'',html:'<div class=darrow></div>',iconSize:[14,18],iconAnchor:[7,11]})});
+    m.on('dragstart zoomstart',e=>{if(e.type==='dragstart')lmFollow=Date.now();});
+    drawMap();});
+  // no tiles within 6 s means no internet: stay on the plain map
+  setTimeout(()=>{if(!ok){m.remove();el.hidden=true;}},6000);
+}
+function liveMapUpdate(){
+  const d=mapData; if(!d)return;
+  if(d.past.length!==lmPast){lml.past.clearLayers();d.past.forEach(t=>L.polyline(t,{color:'#9aa4b2',weight:2,opacity:.6}).addTo(lml.past));lmPast=d.past.length;}
+  lml.track.setLatLngs(d.track);
+  if(d.home){lml.home.setLatLng(d.home);if(!lmap.hasLayer(lml.home))lml.home.addTo(lmap);}
+  if(d.drone){const p=[d.drone.lat,d.drone.lon];lml.drone.setLatLng(p);if(!lmap.hasLayer(lml.drone))lml.drone.addTo(lmap);
+    const a=lml.drone.getElement();if(a)a.firstChild.style.transform='rotate('+(d.drone.heading||0)+'deg)';
+    // follow the drone unless the map was dragged in the last 15 s
+    if(Date.now()-lmFollow>15000&&!lmap.getBounds().pad(-0.25).contains(p))lmap.setView(p,Math.max(lmap.getZoom(),18));}
+}
+function loadLeaflet(){if(window.L)return liveMapTry();const sc=document.createElement('script');
+  sc.src='https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js';sc.onload=liveMapTry;document.head.appendChild(sc);}
+addEventListener('online',()=>{if(!lmap)loadLeaflet();});
+loadLeaflet();
 setInterval(pollMap,1000);pollMap();
 async function poll(){
   try{render(await (await fetch('/status',{cache:'no-store'})).json());}
@@ -496,10 +548,48 @@ def make_handler(cam):
             self.end_headers()
             self.wfile.write(body)
 
+        def _recording(self, path):
+            """Serve /rec/<name>/data, /frame/<i>.jpg, /track.kml, /track.geojson."""
+            parts = path.split("/")      # ['', 'rec', name, what, (i.jpg)]
+            folder = recording_folder(RECORDINGS, parts[2]) if len(parts) >= 4 else None
+            if not folder:
+                return self._send(404, "text/plain", b"no such recording")
+            if parts[3] == "data":
+                return self._send(200, "application/json", json.dumps(recording_data(folder)).encode())
+            if parts[3] == "frame" and len(parts) == 5 and parts[4].endswith(".jpg"):
+                try:
+                    jpeg = frame_bytes(folder, int(parts[4][:-4]))
+                except ValueError:
+                    jpeg = None
+                return self._send(200, "image/jpeg", jpeg) if jpeg else self._send(404, "text/plain", b"no frame")
+            if parts[3] in ("track.kml", "track.geojson"):
+                f = os.path.join(folder, parts[3])
+                if os.path.exists(f):
+                    self.send_response(200)
+                    ctype = "application/vnd.google-earth.kml+xml" if f.endswith("kml") else "application/geo+json"
+                    body = open(f, "rb").read()
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Content-Disposition", 'attachment; filename="raven2_%s_%s"' % (parts[2], parts[3]))
+                    self.end_headers()
+                    return self.wfile.write(body)
+            return self._send(404, "text/plain", b"not found")
+
         def do_GET(self):
             path = self.path.split("?")[0]
-            if path == "/":
+            if path == "/" and cam.library:
+                self.send_response(302)
+                self.send_header("Location", "/player")
+                self.end_headers()
+            elif path == "/":
                 self._send(200, "text/html; charset=utf-8", PAGE.encode())
+            elif path == "/player":
+                self._send(200, "text/html; charset=utf-8", PLAYER_PAGE.encode())
+            elif path == "/recordings":
+                body = {"live": not cam.library and not cam.replay, "recordings": list_recordings(RECORDINGS)}
+                self._send(200, "application/json", json.dumps(body).encode())
+            elif path.startswith("/rec/"):
+                self._recording(path)
             elif path == "/status":
                 self._send(200, "application/json", json.dumps(cam.status()).encode())
             elif path == "/map":
@@ -559,9 +649,11 @@ def main():
                     help="play a recording instead of connecting to the drone")
     ap.add_argument("--speed", type=float, default=1.0, help="replay speed")
     ap.add_argument("--loop", action="store_true", help="repeat the replay")
+    ap.add_argument("--library", action="store_true",
+                    help="only browse and play recordings; never contacts the drone")
     args = ap.parse_args()
     ip = args.ip
-    if args.replay:
+    if args.replay or args.library:
         return serve_replay(args)
     print("This viewer sends only these messages:")
     print(" video, TCP %s:%d" % (ip, VIDEO_PORT))
@@ -619,14 +711,20 @@ def main():
 
 
 def serve_replay(args):
-    """Play a recording through the viewer. Nothing is sent to the drone."""
-    folder = os.path.abspath(args.replay)
+    """Replay or browse recordings. Nothing is ever sent to the drone."""
     cam = Camera(None)
-    cam.replay = os.path.basename(folder)
-    Replay(cam, folder, speed=args.speed, loop=args.loop).start()
+    if args.library:
+        cam.library = True
+        what = "Recordings"
+    else:
+        folder = os.path.abspath(args.replay)
+        cam.replay = os.path.basename(folder)
+        Replay(cam, folder, speed=args.speed, loop=args.loop).start()
+        what = "Replaying " + cam.replay
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(cam))
     server.daemon_threads = True
-    print("Replaying %s: open http://localhost:%d  (Ctrl+C to stop)" % (cam.replay, args.port))
+    url = "http://localhost:%d%s" % (args.port, "/player" if args.library else "")
+    print("%s: open %s  (Ctrl+C to stop)" % (what, url), flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
