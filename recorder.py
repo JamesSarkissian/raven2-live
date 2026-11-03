@@ -16,12 +16,17 @@ import json
 import math
 import os
 import re
+import shutil
 import threading
 import time
 
 EARTH_R = 6371000.0
 MIN_STEP_M = 1.0        # add a track point once the drone has moved this far
 AUTO_STOP_AFTER = 5.0   # seconds locked before an auto-started recording stops
+TAKEOFF_CONFIRM = 2.0   # seconds the motors must stay unlocked to count as a takeoff;
+                        # the drone sometimes reports "Unlocked" for a single packet
+                        # while the motors lock after landing
+NEW_FLIGHT_GAP = 5.0    # seconds locked before a later takeoff counts as a new flight
 
 
 def valid_fix(t):
@@ -40,12 +45,23 @@ def distance_m(a, b):
 
 
 class Track(object):
-    """GPS flight path: a point every MIN_STEP_M metres, plus the home point."""
+    """GPS flight path: a point every MIN_STEP_M metres, plus the home point.
 
-    def __init__(self):
+    Home is where the motors were unlocked for takeoff (where the drone measures
+    distance from). Until a takeoff is confirmed it is the first GPS position.
+    keep_home=True (recordings) keeps the first takeoff; otherwise a takeoff
+    after the motors were locked for NEW_FLIGHT_GAP starts a new home.
+    """
+
+    def __init__(self, keep_home=False):
         self.points = []        # (t, lat, lon, alt_m)
         self.home = None
-        self._state = None
+        self.keep_home = keep_home
+        self._takeoff_home = False
+        self._unlock_t = None   # when the current unlock began
+        self._unlock_pos = None
+        self._unlock_new = False
+        self._locked_t = None   # when the current locked period began
         self.lock = threading.Lock()
 
     def update(self, tel, t=None):
@@ -54,10 +70,20 @@ class Track(object):
         t = time.time() if t is None else t
         pos = (tel["lat"], tel["lon"])
         with self.lock:
-            # the drone measures distance from where the motors were unlocked
-            if tel.get("state") == "Unlocked" and self._state != "Unlocked":
-                self.home = pos
-            self._state = tel.get("state")
+            if tel.get("state") == "Unlocked":
+                if self._unlock_t is None:
+                    # motors just unlocked: remember where, and confirm it later
+                    self._unlock_t, self._unlock_pos = t, pos
+                    self._unlock_new = (self._locked_t is None
+                                        or t - self._locked_t >= NEW_FLIGHT_GAP)
+                elif self._unlock_pos and t - self._unlock_t >= TAKEOFF_CONFIRM:
+                    if self._unlock_new and not (self.keep_home and self._takeoff_home):
+                        self.home, self._takeoff_home = self._unlock_pos, True
+                    self._unlock_pos = None
+            else:
+                if self._unlock_t is not None or self._locked_t is None:
+                    self._locked_t = t
+                self._unlock_t = None
             if self.home is None:
                 self.home = pos
             if not self.points or distance_m(self.points[-1][1:3], pos) >= MIN_STEP_M:
@@ -117,7 +143,8 @@ class Recorder(object):
         self.fields = fields
         self.auto = auto
         self.start = time.time()
-        self.track = Track()
+        self.track = Track(keep_home=True)
+        self.unlocked_s = 0.0   # time the motors were unlocked during this recording
         self.frames = 0
         self.bytes = 0
         self.lock = threading.Lock()
@@ -187,6 +214,7 @@ class FlightLog(object):
         self.last = None        # status of the most recent finished recording
         self._locked_since = None
         self._state = None
+        self._last_t = None
         self.lock = threading.Lock()
 
     def start(self, auto=False):
@@ -200,7 +228,11 @@ class FlightLog(object):
             rec, self.rec = self.rec, None
         if rec:
             rec.stop()
-            self.last = rec.status()
+            if rec.auto and rec.unlocked_s < TAKEOFF_CONFIRM:
+                # started by a one-packet "Unlocked" blip, not a takeoff
+                shutil.rmtree(rec.folder, ignore_errors=True)
+            else:
+                self.last = rec.status()
         return self.last
 
     def frame(self, jpeg, t):
@@ -210,9 +242,12 @@ class FlightLog(object):
 
     def telemetry(self, snapshot, t):
         rec = self.rec
+        state = snapshot.get("state")
         if rec:
             rec.telemetry(snapshot, t)
-        state = snapshot.get("state")
+            if state == "Unlocked" and self._state == "Unlocked" and self._last_t is not None:
+                rec.unlocked_s += t - self._last_t
+        self._last_t = t
         if self.auto_record and state == "Unlocked" and self._state != "Unlocked" and not rec:
             self.start(auto=True)
         # auto-started recordings stop a few seconds after the motors lock again
@@ -392,3 +427,23 @@ def frame_bytes(folder, i):
     with open(os.path.join(folder, "video.mjpg"), "rb") as f:
         f.seek(idx[i][0])
         return f.read(idx[i][1])
+
+
+def rebuild_track(folder):
+    """Recompute track.geojson/kml and meta from telemetry.csv (after a fix to
+    the home or path logic). The video and flight data are not touched."""
+    track = Track(keep_home=True)
+    with open(os.path.join(folder, "telemetry.csv")) as f:
+        for r in csv.DictReader(f):
+            t = float(r.pop("t"))
+            track.update({k: _parse(v) for k, v in r.items()}, t)
+    name = os.path.basename(os.path.normpath(folder))
+    track.write(folder, name)
+    meta_path = os.path.join(folder, "meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta.update(track_points=len(track.points), track_length_m=round(track.length_m(), 1))
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=1)
+    return track
