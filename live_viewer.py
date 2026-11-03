@@ -12,10 +12,16 @@ It never opens the movement port (9060) or settings port (8060), sends no
 stick, arm, calibration or settings command, and changes no setting.
 --no-telemetry skips the telemetry request. --demo fills the overlay with
 simulated values (clearly marked DEMO) to preview the layout.
+
+Flights are recorded to recordings/ (video + flight data + GPS path, see
+recorder.py): press REC, or recording starts by itself when the motors
+unlock. --replay recordings/<name> plays a recording back through the
+viewer without touching the drone.
 """
 import argparse
 import json
 import math
+import os
 import signal
 import socket
 import struct
@@ -30,6 +36,7 @@ from stream_test import (CMD_HEARTBEAT, CMD_RET_STREAM, DRONE_IP, HDR_LEN,
                          HEARTBEAT, HEARTBEAT_EVERY, MAGIC, START, STOP,
                          VIDEO_PORT, recv_exact)
 import telemetry as tm
+from recorder import FlightLog, Replay, Track, past_tracks, valid_fix
 
 HTTP_PORT = 8765
 TELEMETRY_FIELDS = ("battery_pct", "battery_v", "alt_m", "dist_m",
@@ -37,6 +44,7 @@ TELEMETRY_FIELDS = ("battery_pct", "battery_v", "alt_m", "dist_m",
                     "sats", "gps_fix", "roll_deg", "pitch_deg", "yaw_deg",
                     "state")
 BATTERY_WINDOW = 5   # seconds; battery % shown is the lowest raw value in this window
+RECORDINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 
 
 class Camera(threading.Thread):
@@ -55,6 +63,9 @@ class Camera(threading.Thread):
         self.telemetry = dict.fromkeys(TELEMETRY_FIELDS)
         self.demo = False
         self.tel_time = 0.0
+        self.track = Track()    # this session's flight path for the live map
+        self.log = None         # FlightLog when recording is possible
+        self.replay = None      # recording name when replaying
         self._sock = None
 
     def run(self):
@@ -85,10 +96,7 @@ class Camera(threading.Thread):
                     frame = bytearray(body[32:32 + size])
                     if ints[4] == 129:
                         unscramble(frame, ints[5], ints[6])
-                    with self.cond:
-                        self.frame = bytes(frame)
-                        self.seq += 1
-                        self.cond.notify_all()
+                    self.publish_frame(bytes(frame))
                     count += 1
                     if time.time() - t0 >= 1:
                         self.fps, count, t0 = count / (time.time() - t0), 0, time.time()
@@ -110,13 +118,36 @@ class Camera(threading.Thread):
             except OSError:
                 pass
 
+    def publish_frame(self, jpeg):
+        with self.cond:
+            self.frame = jpeg
+            self.seq += 1
+            self.cond.notify_all()
+        if self.log:
+            self.log.frame(jpeg, time.time())
+
     def set_telemetry(self, **values):
         self.telemetry.update((k, v) for k, v in values.items() if k in TELEMETRY_FIELDS)
+        now = self.tel_time = time.time()
+        snapshot = dict(self.telemetry)
+        self.track.update(snapshot, now)
+        if self.log:
+            self.log.telemetry(snapshot, now)
+
+    def map_data(self):
+        t = self.telemetry
+        log = self.log
+        current = log.rec.name if log and log.rec else None
+        return {"home": self.track.home, "track": self.track.latlon(),
+                "past": past_tracks(RECORDINGS, skip=current) if not self.replay else [],
+                "drone": {"lat": t["lat"], "lon": t["lon"], "heading": t["heading_deg"]}
+                if valid_fix(t) else None}
 
     def status(self):
         return {"connected": self.connected, "error": self.error,
                 "fps": round(self.fps, 1), "frames": self.seq,
-                "demo": self.demo, "telemetry": self.telemetry,
+                "demo": self.demo, "telemetry": self.telemetry, "replay": self.replay,
+                "log": self.log.status() if self.log else None,
                 "telemetry_age": round(time.time() - self.tel_time, 1) if self.tel_time else None}
 
 
@@ -163,7 +194,6 @@ class Telemetry(threading.Thread):
                         self.battery.popleft()
                     values["battery_pct"] = min(b for _, b in self.battery)
                 self.cam.set_telemetry(**values)
-                self.cam.tel_time = time.time()
 
     def close(self):
         self.sock.close()
@@ -183,7 +213,6 @@ def run_demo(cam):
             lon=-74.006000 + 0.0003 * math.cos(t / 15), sats=11,
             roll_deg=6 * math.sin(t / 2), pitch_deg=-4 * math.cos(t / 3),
             yaw_deg=(t * 12) % 360, gps_fix=True, state="Locked")
-        cam.tel_time = time.time()
         time.sleep(0.2)
 
 
@@ -243,12 +272,21 @@ PAGE = """<!doctype html>
 #state{font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;border-radius:4px;padding:1px 5px;background:#2a3340;color:var(--dim)}
 #state.armed{background:var(--bad);color:#fff}#state.landing{background:var(--warn);color:#111}
 #wrap.stale .hud .v,#wrap.stale #tr{opacity:.45}
+/* recording */
+#rec{font:inherit;font-size:10px;font-weight:700;letter-spacing:.06em;border-radius:4px;padding:1px 6px;background:#2a3340;color:var(--dim);border:0;cursor:pointer}
+#rec:hover{color:var(--fg)}
+#rec.on{background:var(--bad);color:#fff}
+#rec.on:before{content:"● ";animation:blink 1s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+/* flight map: small in the corner, click to enlarge */
+#map{top:62px;right:10px;padding:0;overflow:hidden;cursor:pointer;line-height:0}
+#mapc{display:block}
 /* controls appear on mouse move */
 #ctl{bottom:10px;right:10px;display:flex;gap:6px;opacity:0;transition:opacity .25s}
 #wrap.active #ctl{opacity:1}
 button{background:#1f2630;color:var(--fg);border:1px solid #2e3744;border-radius:6px;padding:5px 9px;font:inherit;font-size:12px;cursor:pointer}
 button:hover{background:#2a3340}
-@media (max-width:560px){#pflist{width:220px}#tr{top:auto;bottom:62px;right:10px}#att{bottom:62px}.cell{padding:1px 5px}.cell .v{font-size:13px}.k{font-size:9px}#fps{display:none}}
+@media (max-width:560px){#pflist{width:220px}#map{top:40px}#tr{top:auto;bottom:62px;right:10px}#att{bottom:62px}.cell{padding:1px 5px}.cell .v{font-size:13px}.k{font-size:9px}#fps{display:none}}
 </style></head><body>
 <div id=wrap>
   <img id=video src="/stream.mjpg" alt="Live drone camera">
@@ -257,10 +295,12 @@ button:hover{background:#2a3340}
     <span id=link title="Camera link"><span class=dot></span></span><span id=fps></span>
     <span id=bat class=na title="Battery"><span id=batbar><div id=batfill></div></span><span class=v id=batv>—</span></span>
     <span id=state title="Motor state" hidden></span>
+    <button id=rec title="Record video, flight data and GPS path (R)" hidden>REC</button>
     <span id=demo title="Simulated values, not from the drone" hidden>DEMO</span>
   </div>
   <div class=hud id=nodata>No flight data from the drone yet</div>
   <div class=hud id=tr><span class=k>GPS <span id=sats></span></span><br><span id=lat>—</span><br><span id=lon>—</span></div>
+  <div class=hud id=map title="Flight map: click to enlarge"><canvas id=mapc width=170 height=128></canvas></div>
   <div class=hud id=strip>
     <div class=cell id=c_alt><div class=k>Alt</div><span class=v id=alt>—</span></div>
     <div class=cell id=c_dist><div class=k>Dist</div><span class=v id=dist>—</span></div>
@@ -289,7 +329,6 @@ function render(s){
   $('link').title=s.connected?'Camera connected':(s.error||'Not connected');
   $('fps').textContent=s.connected?s.fps+' fps':(s.error?'reconnecting…':'offline');
   $('empty').style.display=s.frames?'none':'';
-  $('demo').hidden=!s.demo;
   const t=s.telemetry, have=Object.values(t).some(v=>v!=null);
   const stale=have&&(s.telemetry_age==null||s.telemetry_age>3);
   $('wrap').classList.toggle('stale',stale);
@@ -306,11 +345,14 @@ function render(s){
   setv('alt',len(t.alt_m));setv('dist',len(t.dist_m));setv('hs',spd(t.hspeed_ms));
   setv('vs',t.vspeed_ms==null?null:(t.vspeed_ms>0.05?'↑':t.vspeed_ms<-0.05?'↓':'')+spd(Math.abs(t.vspeed_ms)));
   setv('hdg',t.heading_deg==null?null:deg(t.heading_deg)+' <span class=u>'+DIRS[Math.round(((t.heading_deg%360)+360)%360/45)%8]+'</span>');
-  $('lat').textContent=t.lat==null?'—':Math.abs(t.lat).toFixed(6)+'° '+(t.lat>=0?'N':'S');
-  $('lon').textContent=t.lon==null?'—':Math.abs(t.lon).toFixed(6)+'° '+(t.lon>=0?'E':'W');
+  const fix=t.lat!=null&&!(t.lat===0&&t.lon===0)&&t.gps_fix!==false;
+  $('lat').textContent=!fix?'—':Math.abs(t.lat).toFixed(6)+'° '+(t.lat>=0?'N':'S');
+  $('lon').textContent=!fix?'—':Math.abs(t.lon).toFixed(6)+'° '+(t.lon>=0?'E':'W');
   $('sats').textContent=t.sats==null?'':'· '+t.sats+' sats'+(t.gps_fix===false?' · no fix':'');
   setv('roll',deg(t.roll_deg));setv('pitch',deg(t.pitch_deg));setv('yaw',deg(t.yaw_deg));
   pfRender(s);
+  recRender(s);
+  $('demo').hidden=!(s.demo||s.replay);$('demo').textContent=s.replay?'REPLAY':'DEMO';
 }
 // ---- preflight checklist -------------------------------------------------
 // auto: confirmed live from drone data; manual: tick when done (remote has no data link to us)
@@ -371,6 +413,60 @@ function pfRender(s){
   $('pfarrow').textContent=pfOpen?'▴':'▾';
 }
 $('pfhead').onclick=()=>{pfOpen=!pfOpen;pfRender(last);};
+// ---- recording -------------------------------------------------------------
+const mmss=x=>Math.floor(x/60)+':'+String(Math.floor(x%60)).padStart(2,'0');
+function recRender(s){
+  const b=$('rec'); b.hidden=!s.log;
+  if(!s.log)return;
+  const r=s.log.recording; b.classList.toggle('on',!!r);
+  b.textContent=r?'REC '+mmss(r.elapsed):'REC';
+  b.title=r?('Recording '+r.name+(r.auto?' (started on unlock)':'')+' · '+r.mb+' MB · click to stop')
+          :'Record video, flight data and GPS path (R)'+(s.log.auto_record?' · starts by itself when motors unlock':'');
+}
+async function recToggle(){
+  const on=$('rec').classList.contains('on');
+  try{await fetch(on?'/record/stop':'/record/start',{method:'POST'});}catch(e){}
+  poll();
+}
+$('rec').onclick=recToggle;
+document.addEventListener('keydown',e=>{if((e.key==='r'||e.key==='R')&&!$('rec').hidden)recToggle();});
+// ---- flight map --------------------------------------------------------------
+let mapBig=false, mapData=null;
+const NICE=[1,2,5,10,20,50,100,200,500,1000,2000,5000];
+function drawMap(){
+  const c=$('mapc'), small=innerWidth<560, W=mapBig?Math.min(460,innerWidth-20):(small?120:170), H=Math.round(W*.75);
+  const dpr=devicePixelRatio||1;
+  if(c.width!==Math.round(W*dpr)){c.width=Math.round(W*dpr);c.height=Math.round(H*dpr);c.style.width=W+'px';c.style.height=H+'px';}
+  const g=c.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  g.font='10px -apple-system,system-ui,sans-serif';
+  const d=mapData;
+  if(!d||(!d.drone&&!d.track.length)){g.fillStyle='#9aa4b2';g.textAlign='center';g.fillText('Waiting for GPS fix',W/2,H/2+3);return;}
+  const ref=d.drone?[d.drone.lat,d.drone.lon]:d.track[d.track.length-1];
+  const kx=111320*Math.cos(ref[0]*Math.PI/180), ky=110540;
+  const xy=p=>[(p[1]-ref[1])*kx,(p[0]-ref[0])*ky];
+  // fit this flight and home; at least 50 m across
+  const pts=d.track.map(xy); if(d.home)pts.push(xy(d.home)); pts.push([0,0]);
+  let x0=Math.min(...pts.map(p=>p[0])),x1=Math.max(...pts.map(p=>p[0]));
+  let y0=Math.min(...pts.map(p=>p[1])),y1=Math.max(...pts.map(p=>p[1]));
+  const cx=(x0+x1)/2, cy=(y0+y1)/2, span=Math.max(50,(x1-x0)*1.25,(y1-y0)*1.25*W/H);
+  const sc=W/span, px=p=>[W/2+(p[0]-cx)*sc,H/2-(p[1]-cy)*sc];
+  const line=(arr,color,width)=>{if(arr.length<2)return;g.beginPath();arr.forEach((p,i)=>{const q=px(xy(p));i?g.lineTo(q[0],q[1]):g.moveTo(q[0],q[1]);});g.strokeStyle=color;g.lineWidth=width;g.lineJoin='round';g.stroke();};
+  for(const t of d.past)line(t,'rgba(154,164,178,.45)',2);      // earlier flights = covered ground
+  line(d.track,'#38bdf8',2.5);                                   // this flight
+  if(d.home){const h=px(xy(d.home));g.fillStyle='#ffb020';g.beginPath();g.arc(h[0],h[1],6,0,7);g.fill();
+    g.fillStyle='#111';g.textAlign='center';g.font='bold 8px system-ui';g.fillText('H',h[0],h[1]+3);}
+  if(d.drone){const p=px([0,0]),a=(d.drone.heading||0)*Math.PI/180;
+    g.save();g.translate(p[0],p[1]);g.rotate(a);g.beginPath();g.moveTo(0,-8);g.lineTo(5.5,6);g.lineTo(0,3);g.lineTo(-5.5,6);g.closePath();
+    g.fillStyle='#fff';g.strokeStyle='#0b0d10';g.lineWidth=1.5;g.fill();g.stroke();g.restore();}
+  // north arrow and scale bar
+  g.fillStyle='#9aa4b2';g.textAlign='left';g.font='bold 10px system-ui';g.fillText('N ↑',6,13);
+  const target=span/4, m=NICE.reduce((b,v)=>v<=target?v:b,1), len=m*sc;
+  g.strokeStyle='#eef1f5';g.lineWidth=2;g.beginPath();g.moveTo(6,H-8);g.lineTo(6+len,H-8);g.stroke();
+  g.font='10px system-ui';g.fillStyle='#eef1f5';g.fillText(m>=1000?m/1000+' km':m+' m',10+len,H-5);
+}
+async function pollMap(){try{mapData=await (await fetch('/map',{cache:'no-store'})).json();}catch(e){mapData=null;}drawMap();}
+$('map').onclick=()=>{mapBig=!mapBig;drawMap();};
+setInterval(pollMap,1000);pollMap();
 async function poll(){
   try{render(await (await fetch('/status',{cache:'no-store'})).json());}
   catch(e){$('link').className='';$('fps').textContent='viewer stopped';}
@@ -406,6 +502,8 @@ def make_handler(cam):
                 self._send(200, "text/html; charset=utf-8", PAGE.encode())
             elif path == "/status":
                 self._send(200, "application/json", json.dumps(cam.status()).encode())
+            elif path == "/map":
+                self._send(200, "application/json", json.dumps(cam.map_data()).encode())
             elif path == "/frame.jpg":
                 if cam.frame:
                     self._send(200, "image/jpeg", cam.frame)
@@ -431,6 +529,19 @@ def make_handler(cam):
             else:
                 self._send(404, "text/plain", b"not found")
 
+        def do_POST(self):
+            path = self.path.split("?")[0]
+            if not cam.log:
+                self._send(409, "text/plain", b"recording is off in demo and replay")
+            elif path == "/record/start":
+                cam.log.start()
+                self._send(200, "application/json", json.dumps(cam.log.status()).encode())
+            elif path == "/record/stop":
+                cam.log.stop()
+                self._send(200, "application/json", json.dumps(cam.log.status()).encode())
+            else:
+                self._send(404, "text/plain", b"not found")
+
     return Handler
 
 
@@ -442,8 +553,16 @@ def main():
     ap.add_argument("--port", type=int, default=HTTP_PORT, help="local web page port")
     ap.add_argument("--no-telemetry", action="store_true",
                     help="video only; do not request flight data")
+    ap.add_argument("--no-auto-record", action="store_true",
+                    help="do not start recording when the motors unlock")
+    ap.add_argument("--replay", metavar="FOLDER",
+                    help="play a recording instead of connecting to the drone")
+    ap.add_argument("--speed", type=float, default=1.0, help="replay speed")
+    ap.add_argument("--loop", action="store_true", help="repeat the replay")
     args = ap.parse_args()
     ip = args.ip
+    if args.replay:
+        return serve_replay(args)
     print("This viewer sends only these messages:")
     print(" video, TCP %s:%d" % (ip, VIDEO_PORT))
     print("  start stream, once:   ", START.hex(" "))
@@ -464,6 +583,9 @@ def main():
         signal.signal(sig, interrupt)
 
     cam = Camera(ip)
+    if not args.demo:
+        cam.log = FlightLog(RECORDINGS, TELEMETRY_FIELDS,
+                            auto_record=not args.no_auto_record)
     cam.start()
     if args.demo:
         threading.Thread(target=run_demo, args=(cam,), daemon=True).start()
@@ -486,10 +608,34 @@ def main():
         cam.stop()
         if tel:
             tel.close()
+        if cam.log and cam.log.rec:
+            cam.log.stop()
+            print("\nSaved recording %s" % cam.log.last["name"])
         with cam.cond:
             cam.cond.notify_all()
         server.server_close()
         print("\nStopped. Sent stop stream to the camera.")
+    return 0
+
+
+def serve_replay(args):
+    """Play a recording through the viewer. Nothing is sent to the drone."""
+    folder = os.path.abspath(args.replay)
+    cam = Camera(None)
+    cam.replay = os.path.basename(folder)
+    Replay(cam, folder, speed=args.speed, loop=args.loop).start()
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(cam))
+    server.daemon_threads = True
+    print("Replaying %s: open http://localhost:%d  (Ctrl+C to stop)" % (cam.replay, args.port))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cam.running = False
+        with cam.cond:
+            cam.cond.notify_all()
+        server.server_close()
     return 0
 
 

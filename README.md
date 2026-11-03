@@ -26,6 +26,21 @@ battery. Steps the drone reports are ticked automatically; horizontal turns are 
 from the heading after the compass step is ticked; the rest are tapped by hand. It folds
 away when everything is ready or the motors unlock.
 
+## Recording, replay and flight map
+- **REC** (top left, or press `R`) records the camera video, all flight data and the GPS
+  path to `recordings/<date_time>/`. Recording also **starts by itself when the motors
+  unlock** and stops 5 s after they lock again (`--no-auto-record` turns that off).
+- Each recording holds `video.mjpg` + `frames.csv` (frame timestamps), `telemetry.csv`,
+  `track.geojson` and `track.kml` (open in geojson.io or Google Earth), and `meta.json`.
+  Video and flight data share Unix timestamps, so every frame has a position.
+- The **flight map** (top right, click to enlarge) draws this flight's path, home (H),
+  the drone and its heading, and earlier flights in grey to show ground already covered.
+  It has no street map, because the drone's Wi-Fi has no internet.
+- `./live_viewer.py --replay recordings/<name> [--speed 2] [--loop]` plays a recording
+  through the viewer without connecting to the drone.
+- `./fake_drone.py FRAMES_DIR [UDP_TEXT]` imitates the drone on this Mac for testing:
+  run it, then `./live_viewer.py 127.0.0.1 --port 8766`.
+
 `./live_viewer.py --demo` previews the overlay with simulated values; `--no-telemetry` is video only.
 
 ## Files
@@ -38,8 +53,10 @@ away when everything is ready or the motors unlock.
 | `decode_stream.py` | Turns a capture into JPEG frames and a playback page |
 | `drone_probe.sh` | Listen-only network probe |
 | `udp_parse.py` | Reads `tcpdump -x` text for analysis |
+| `recorder.py` | Flight recorder, replay and GPS track |
+| `fake_drone.py` | Imitates the drone locally for testing |
 
-Captures (`capture_*/`, `stream_*/`, `probe_*/`) are git-ignored: they contain
+Captures and recordings (`capture_*/`, `stream_*/`, `probe_*/`, `recordings/`) are git-ignored: they contain
 GPS location and camera images.
 
 ## Protocol notes

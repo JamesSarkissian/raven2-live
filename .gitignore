@@ -2,6 +2,7 @@
 capture_*/
 stream_*/
 probe_*/
+recordings/
 *.pcap
 *.pcapng
 *.h264
