@@ -17,3 +17,7 @@ __pycache__/
 # Built helpers
 .build/
 models/
+
+# Screenshots: camera images with GPS location
+drone_screenshots/
+screenshots/

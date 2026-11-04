@@ -22,6 +22,7 @@ import argparse
 import json
 import math
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -31,6 +32,7 @@ import threading
 import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from xml.sax.saxutils import escape
 
 from lw_unscramble import unscramble
 from stream_test import (CMD_HEARTBEAT, CMD_RET_STREAM, DRONE_IP, HDR_LEN,
@@ -51,6 +53,10 @@ STALL_RECONNECT = 8.0   # seconds without any video data before reconnecting
 MAX_MESSAGE = 4_000_000 # bigger "frames" mean the stream is out of step
 HERE = os.path.dirname(os.path.abspath(__file__))
 RECORDINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
+SHOTS = os.environ.get("RAVEN_SHOTS", os.path.join(HERE, "drone_screenshots"))   # SHOT button saves here
+# the detector needs TensorFlow, which lives in its own Python environment
+TF_PYTHON = os.environ.get("RAVEN_TF_PYTHON", os.path.expanduser("~/PotholeRecognitionModel/tf_env/bin/python"))
+MODEL = os.environ.get("RAVEN_MODEL", os.path.join(HERE, "models", "road_damage", "best.keras"))
 
 
 class Camera(threading.Thread):
@@ -77,6 +83,8 @@ class Camera(threading.Thread):
         self.log = None         # FlightLog when recording is possible
         self.replay = None      # recording name when replaying
         self.library = False    # recordings-only mode: no drone at all
+        self.detector = None    # LiveDetector (DETECT toggle)
+        self.shots = []         # [lat, lon] of screenshots taken this session
         self._sock = None
 
     def run(self):
@@ -188,6 +196,7 @@ class Camera(threading.Thread):
         current = log.rec.name if log and log.rec else None
         return {"home": self.track.home, "track": self.track.latlon(),
                 "past": past_tracks(RECORDINGS, skip=current) if not self.replay else [],
+                "shots": self.shots,
                 "drone": {"lat": t["lat"], "lon": t["lon"], "heading": t["heading_deg"]}
                 if valid_fix(t) else None}
 
@@ -197,6 +206,7 @@ class Camera(threading.Thread):
                 "link": self.link(), "frames": self.seq,
                 "demo": self.demo, "telemetry": self.telemetry, "replay": self.replay,
                 "log": self.log.status() if self.log else None,
+                "detect": self.detector.status() if self.detector else None,
                 "telemetry_age": round(time.time() - self.tel_time, 1) if self.tel_time else None}
 
 
@@ -280,6 +290,177 @@ class Telemetry(threading.Thread):
 
     def close(self):
         self.sock.close()
+
+
+class LiveDetector(object):
+    """Runs the pothole/crack model on the live video while the DETECT toggle
+    is on. The model needs the TensorFlow Python, so it runs in a helper
+    process (detect_worker.py) that is started on toggle-on and stopped on
+    toggle-off. It always works on the newest frame and skips any it can't
+    keep up with. Read-only: it only looks at frames already received."""
+
+    def __init__(self, cam):
+        self.cam = cam
+        self.on = self.ready = False
+        self.error = ""
+        self.result = None
+        self.gen = 0
+        self.times = deque()
+        self.lock = threading.Lock()
+
+    def start(self):
+        with self.lock:
+            if self.on:
+                return
+            self.on, self.ready, self.error, self.result = True, False, "", None
+            self.gen += 1
+            threading.Thread(target=self._run, args=(self.gen,), daemon=True).start()
+
+    def stop(self):
+        with self.lock:
+            self.on = self.ready = False
+            self.gen += 1
+        with self.cam.cond:
+            self.cam.cond.notify_all()
+
+    def _alive(self, gen):
+        return self.on and self.gen == gen and self.cam.running
+
+    def _run(self, gen):
+        cam = self.cam
+        if not os.path.exists(TF_PYTHON):
+            self.error, self.on = "TensorFlow Python not found at %s" % TF_PYTHON, False
+            return
+        os.makedirs(os.path.join(HERE, ".build"), exist_ok=True)
+        log = open(os.path.join(HERE, ".build", "detect_worker.log"), "ab")
+        try:
+            proc = subprocess.Popen([TF_PYTHON, os.path.join(HERE, "detect_worker.py"), MODEL],
+                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
+        except OSError as e:
+            self.error, self.on = "could not start the detector: %s" % e, False
+            return
+        try:
+            hello = json.loads(proc.stdout.readline() or b'{"error": "detector exited while loading"}')
+            if "error" in hello:
+                self.error, self.on = hello["error"], False
+                return
+            self.ready = self._alive(gen)
+            seen = cam.seq
+            while self._alive(gen):
+                with cam.cond:
+                    cam.cond.wait_for(lambda: cam.seq != seen or not self._alive(gen), timeout=1)
+                    frame, seq = cam.frame, cam.seq
+                if not self._alive(gen) or seq == seen or not frame:
+                    continue
+                seen = seq
+                proc.stdin.write(struct.pack("<I", len(frame)) + frame)
+                proc.stdin.flush()
+                line = proc.stdout.readline()
+                if not line:
+                    raise OSError("detector stopped unexpectedly (see .build/detect_worker.log)")
+                r = json.loads(line)
+                now = time.time()
+                r["seq"], r["t"] = seq, now
+                self.times.append(now)
+                while self.times and now - self.times[0] > 2:
+                    self.times.popleft()
+                if self.gen == gen:
+                    self.result = r
+        except (OSError, ValueError) as e:
+            if self.gen == gen:
+                self.error, self.on, self.ready = str(e), False, False
+        finally:
+            try:
+                proc.stdin.write(struct.pack("<I", 0))
+                proc.stdin.close()
+                proc.wait(3)
+            except (OSError, subprocess.TimeoutExpired):
+                proc.kill()
+            log.close()
+
+    def current(self):
+        """Latest boxes if they are fresh, else none."""
+        r = self.result
+        if not (self.on and r) or time.time() - r["t"] > 1.5:
+            return []
+        return r["dets"]
+
+    def status(self):
+        r = self.result
+        now = time.time()
+        while self.times and now - self.times[0] > 2:
+            self.times.popleft()
+        return {"on": self.on, "ready": self.ready, "error": self.error,
+                "dets": self.current(), "ms": r["ms"] if r and self.on else None,
+                "fps": round(len(self.times) / 2, 1) if self.ready else None}
+
+
+# ---- screenshots ---------------------------------------------------------------
+
+SHOT_NAME = re.compile(r"\d{8}_\d{6}_\d{3}")
+
+
+def save_screenshot(cam):
+    """Save the current video frame to drone_screenshots/ with where and when
+    it was taken (and the detections, if DETECT is on). Returns the metadata.
+    The page then adds <name>_annotated.jpg: the frame with the location
+    caption and any detection boxes drawn on it."""
+    frame = cam.frame
+    if not frame:
+        return None
+    os.makedirs(SHOTS, exist_ok=True)
+    now = time.time()
+    name = time.strftime("%Y%m%d_%H%M%S", time.localtime(now)) + "_%03d" % int(now % 1 * 1000)
+    t = dict(cam.telemetry)
+    fix = valid_fix(t)
+    dets = cam.detector.current() if cam.detector and cam.detector.on else None
+    meta = {"name": name, "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)), "unix": round(now, 3),
+            "lat": t["lat"] if fix else None, "lon": t["lon"] if fix else None, "gps_fix": bool(fix),
+            "sats": t["sats"], "alt_m": t["alt_m"], "dist_m": t["dist_m"], "heading_deg": t["heading_deg"],
+            "state": t["state"], "battery_pct": t["battery_pct"],
+            "google_maps": "https://www.google.com/maps/search/?api=1&query=%.7f,%.7f" % (t["lat"], t["lon"]) if fix else None,
+            "detection_on": dets is not None,
+            "detections": [{"class": d[0], "score": d[1], "box": d[2:]} for d in dets or []],
+            "image": name + ".jpg", "annotated": name + "_annotated.jpg",
+            "source": "replay of %s" % cam.replay if cam.replay else ("demo" if cam.demo else "live")}
+    with open(os.path.join(SHOTS, name + ".jpg"), "wb") as f:
+        f.write(frame)
+    with open(os.path.join(SHOTS, name + ".json"), "w") as f:
+        json.dump(meta, f, indent=1)
+    write_screenshot_index()
+    if fix:
+        cam.shots.append([t["lat"], t["lon"]])
+    return meta
+
+
+def write_screenshot_index():
+    """screenshots.geojson and screenshots.kml: a pin for every screenshot
+    with a GPS fix, for Google Earth / any map tool."""
+    shots = []
+    for n in sorted(os.listdir(SHOTS)):
+        if n.endswith(".json") and SHOT_NAME.fullmatch(n[:-5]):
+            try:
+                with open(os.path.join(SHOTS, n)) as f:
+                    m = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if m.get("gps_fix"):
+                shots.append(m)
+    found = lambda m: ", ".join("%s %d%%" % (d["class"], d["score"] * 100) for d in m["detections"]) or (
+        "none" if m["detection_on"] else "detection off")
+    gj = {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "geometry": {"type": "Point", "coordinates": [m["lon"], m["lat"]]},
+         "properties": {"name": m["name"], "time": m["time"], "image": m["image"], "annotated": m["annotated"],
+                        "alt_m": m["alt_m"], "detections": found(m)}} for m in shots]}
+    with open(os.path.join(SHOTS, "screenshots.geojson"), "w") as f:
+        json.dump(gj, f, indent=1)
+    pins = "".join(
+        "<Placemark><name>%s</name><description>%s · alt %s m · %s · image %s</description>"
+        "<Point><coordinates>%.7f,%.7f,0</coordinates></Point></Placemark>\n"
+        % (m["name"], m["time"], m["alt_m"], escape(found(m)), m["annotated"], m["lon"], m["lat"]) for m in shots)
+    with open(os.path.join(SHOTS, "screenshots.kml"), "w") as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">'
+                "<Document><name>Raven 2 screenshots</name>\n%s</Document></kml>\n" % pins)
 
 
 def run_demo(cam):
@@ -374,6 +555,18 @@ PAGE = """<!doctype html>
 .dhome{background:var(--warn);color:#111;font:700 9px system-ui;border-radius:50%;line-height:14px;text-align:center;border:2px solid #111}
 #recs{font-size:10px;font-weight:700;letter-spacing:.06em;border-radius:4px;padding:1px 6px;background:#2a3340;color:var(--dim);text-decoration:none;text-transform:uppercase}
 #recs:hover{color:var(--fg)}
+/* screenshot + detection toggle */
+.pill{font:inherit;font-size:10px;font-weight:700;letter-spacing:.06em;border-radius:4px;padding:1px 6px;background:#2a3340;color:var(--dim);border:0;cursor:pointer}
+.pill:hover{color:var(--fg);background:#334050}
+#det.on{background:var(--ok);color:#0b0d10}
+#det.loading{background:var(--warn);color:#111}
+#det.err{background:#4a2a2a;color:var(--bad)}
+#boxes{position:absolute;pointer-events:none}
+#flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .35s}
+#flash.go{opacity:.55;transition:none}
+#toast{top:40px;left:50%;transform:translateX(-50%);font-size:12px;white-space:nowrap;opacity:0;transition:opacity .3s;pointer-events:none;max-width:calc(100% - 20px);overflow:hidden;text-overflow:ellipsis}
+#toast.show{opacity:1}
+#toast.bad{color:var(--bad)}
 /* controls appear on mouse move */
 #ctl{bottom:10px;right:10px;display:flex;gap:6px;opacity:0;transition:opacity .25s}
 #wrap.active #ctl{opacity:1}
@@ -383,15 +576,19 @@ button:hover{background:#2a3340}
 </style></head><body>
 <div id=wrap>
   <img id=video src="/stream.mjpg" alt="Live drone camera">
+  <canvas id=boxes></canvas><div id=flash></div>
   <div id=empty>Waiting for the drone camera…</div>
   <div class=hud id=tl>
     <span id=link title="Camera link"><span class=dot></span></span><span id=fps></span>
     <span id=bat class=na title="Battery"><span id=batbar><div id=batfill></div></span><span class=v id=batv>—</span></span>
     <span id=state title="Motor state" hidden></span>
     <button id=rec title="Record video, flight data and GPS path (R)" hidden>REC</button>
+    <button id=shot class=pill title="Screenshot to drone_screenshots/ with its GPS location (S)">SHOT</button>
+    <button id=det class=pill title="Live pothole and crack detection (D)">DETECT</button>
     <a id=recs href="/player" target=_blank rel=noopener title="Browse and play past recordings">Recordings</a>
     <span id=demo title="Simulated values, not from the drone" hidden>DEMO</span>
   </div>
+  <div class=hud id=toast></div>
   <div class=hud id=nodata>No flight data from the drone yet</div>
   <div class=hud id=tr><span class=k>GPS <span id=sats></span></span><br><span id=lat>—</span><br><span id=lon>—</span></div>
   <div class=hud id=map><canvas id=mapc width=170 height=128 title="Flight map: click to enlarge"></canvas><div id=lmapLive hidden></div>
@@ -408,7 +605,7 @@ button:hover{background:#2a3340}
     <div id=pfhead title="Preflight checklist"><span class=k>Preflight</span><span class=v id=pfcount></span><span id=pfarrow class=k>▾</span></div>
     <ul id=pflist></ul>
   </div>
-  <div class=hud id=ctl><button id=units>ft</button><button id=snap>Snapshot</button><button id=full>Full screen</button></div>
+  <div class=hud id=ctl><button id=units>ft</button><button id=full>Full screen</button></div>
 </div>
 <script>
 const $=id=>document.getElementById(id);
@@ -454,6 +651,7 @@ function render(s){
   setv('roll',deg(t.roll_deg));setv('pitch',deg(t.pitch_deg));setv('yaw',deg(t.yaw_deg));
   pfRender(s);
   recRender(s);
+  detRender(s.detect);
   $('demo').hidden=!(s.demo||s.replay);$('demo').textContent=s.replay?'REPLAY':'DEMO';
 }
 // ---- preflight checklist -------------------------------------------------
@@ -559,6 +757,7 @@ function drawMap(){
   const line=(arr,color,width)=>{if(arr.length<2)return;g.beginPath();arr.forEach((p,i)=>{const q=px(xy(p));i?g.lineTo(q[0],q[1]):g.moveTo(q[0],q[1]);});g.strokeStyle=color;g.lineWidth=width;g.lineJoin='round';g.stroke();};
   for(const t of d.past)line(t,'rgba(154,164,178,.45)',2);      // earlier flights = covered ground
   line(d.track,'#38bdf8',2.5);                                   // this flight
+  for(const p of d.shots||[]){const q=px(xy(p));g.fillStyle='#c084fc';g.strokeStyle='#0b0d10';g.lineWidth=1.5;g.beginPath();g.arc(q[0],q[1],3.5,0,7);g.fill();g.stroke();}
   if(d.home){const h=px(xy(d.home));g.fillStyle='#ffb020';g.beginPath();g.arc(h[0],h[1],6,0,7);g.fill();
     g.fillStyle='#111';g.textAlign='center';g.font='bold 8px system-ui';g.fillText('H',h[0],h[1]+3);}
   if(d.drone){const p=px([0,0]),a=(d.drone.heading||0)*Math.PI/180;
@@ -584,7 +783,7 @@ function liveMapTry(){
   const tiles=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:21,maxNativeZoom:19,attribution:'Imagery © Esri'}).addTo(m);
   let ok=false;
   tiles.once('tileload',()=>{ok=true;lmap=m;$('mapc').style.display='none';
-    lml.past=L.layerGroup().addTo(m);lml.track=L.polyline([],{color:'#38bdf8',weight:3}).addTo(m);
+    lml.past=L.layerGroup().addTo(m);lml.shots=L.layerGroup().addTo(m);lml.track=L.polyline([],{color:'#38bdf8',weight:3}).addTo(m);
     lml.home=L.marker([0,0],{icon:L.divIcon({className:'dhome',html:'H',iconSize:[14,14]})});
     lml.drone=L.marker([0,0],{icon:L.divIcon({className:'',html:'<div class=darrow></div>',iconSize:[14,18],iconAnchor:[7,11]})});
     m.on('dragstart zoomstart',e=>{if(e.type==='dragstart')lmFollow=Date.now();});
@@ -596,6 +795,7 @@ function liveMapUpdate(){
   const d=mapData; if(!d)return;
   if(d.past.length!==lmPast){lml.past.clearLayers();d.past.forEach(t=>L.polyline(t,{color:'#9aa4b2',weight:2,opacity:.6}).addTo(lml.past));lmPast=d.past.length;}
   lml.track.setLatLngs(d.track);
+  if((d.shots||[]).length!==lml.nShots){lml.shots.clearLayers();(d.shots||[]).forEach(p=>L.circleMarker(p,{radius:5,color:'#0b0d10',weight:1.5,fillColor:'#c084fc',fillOpacity:1}).bindTooltip('Screenshot').addTo(lml.shots));lml.nShots=(d.shots||[]).length;}
   if(d.home){lml.home.setLatLng(d.home);if(!lmap.hasLayer(lml.home))lml.home.addTo(lmap);}
   if(d.drone){const p=[d.drone.lat,d.drone.lon];lml.drone.setLatLng(p);if(!lmap.hasLayer(lml.drone))lml.drone.addTo(lmap);
     const a=lml.drone.getElement();if(a)a.firstChild.style.transform='rotate('+(d.drone.heading||0)+'deg)';
@@ -614,8 +814,75 @@ async function poll(){
 setInterval(poll,200);poll();
 $('units').textContent=imperial?'m':'ft';
 $('units').onclick=()=>{imperial=!imperial;$('units').textContent=imperial?'m':'ft';try{localStorage.setItem('units',imperial?'ft':'m')}catch(e){}poll();};
-$('snap').onclick=()=>{const a=document.createElement('a');a.href='/frame.jpg?'+Date.now();
-  a.download='raven2_'+new Date().toISOString().replace(/[:.]/g,'-')+'.jpg';a.click();};
+// ---- live detection ------------------------------------------------------------
+const BOXC={pothole:'#ff4d4d',crack:'#ffd21a'};
+let detOn=false, dets=[], lastTel={};
+function drawBoxes(g,list,W,H,k){
+  g.lineJoin='round'; g.font='700 '+Math.round(12*k)+'px -apple-system,system-ui,sans-serif'; g.textBaseline='top';
+  for(const [cls,sc,x0,y0,x1,y1] of list){
+    const c=BOXC[cls]||'#fff', X=x0*W, Y=y0*H, w=(x1-x0)*W, h=(y1-y0)*H;
+    g.strokeStyle=c; g.lineWidth=2.5*k; g.strokeRect(X,Y,w,h);
+    const lab=cls+' '+Math.round(sc*100)+'%', tw=g.measureText(lab).width+8*k, th=17*k, ty=Y>=th?Y-th:Y;
+    g.fillStyle=c; g.fillRect(X-1.25*k,ty,tw,th); g.fillStyle='#000'; g.fillText(lab,X+3*k,ty+2.5*k);
+  }
+}
+function renderBoxes(){
+  const c=$('boxes'), v=$('video'), r=v.getBoundingClientRect(), wr=$('wrap').getBoundingClientRect();
+  const dpr=devicePixelRatio||1, W=Math.round(r.width), H=Math.round(r.height);
+  if(c.width!==W*dpr||c.height!==H*dpr){c.width=W*dpr;c.height=H*dpr;c.style.width=W+'px';c.style.height=H+'px';}
+  c.style.left=(r.left-wr.left)+'px'; c.style.top=(r.top-wr.top)+'px';
+  const g=c.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,W,H);
+  if(detOn&&dets.length)drawBoxes(g,dets,W,H,1);
+}
+function detRender(d){
+  const b=$('det'); if(!d){b.hidden=true;return;}
+  detOn=d.on; dets=d.dets||[];
+  b.className='pill'+(d.on?(d.ready?' on':' loading'):(d.error?' err':''));
+  const n=k=>dets.filter(x=>x[0]===k).length;
+  b.textContent=!d.on?'DETECT':!d.ready?'DETECT…':'DETECT'+(n('pothole')?' · '+n('pothole')+' pothole'+(n('pothole')>1?'s':''):'')+(n('crack')?' · '+n('crack')+' crack'+(n('crack')>1?'s':''):'');
+  b.title=d.error?'Detection stopped: '+d.error+' · click to retry'
+    :!d.on?'Live pothole and crack detection: off (D)'
+    :!d.ready?'Loading the model…':'Detection on · '+d.fps+' frames/s · '+d.ms+' ms per frame · click to turn off (D)';
+  renderBoxes();
+}
+async function detToggle(){
+  try{detRender(await (await fetch(detOn?'/detect/off':'/detect/on',{method:'POST'})).json());}catch(e){}
+}
+$('det').onclick=detToggle;
+// faster updates than /status while detection is on, so boxes keep up with the video
+setInterval(async()=>{if(!detOn)return;try{detRender(await (await fetch('/detections',{cache:'no-store'})).json());}catch(e){}},100);
+addEventListener('resize',renderBoxes);
+// ---- screenshots ---------------------------------------------------------------
+let toastT;
+function toast(msg,bad){const t=$('toast');t.textContent=msg;t.className='hud show'+(bad?' bad':'');clearTimeout(toastT);toastT=setTimeout(()=>t.className='hud',3500);}
+async function takeShot(){
+  const f=$('flash'); f.className='go'; requestAnimationFrame(()=>requestAnimationFrame(()=>f.className=''));
+  let m;
+  try{const r=await fetch('/screenshot',{method:'POST'}); m=await r.json(); if(!r.ok)return toast('Screenshot failed: '+(m.error||r.status),true);}
+  catch(e){return toast('Screenshot failed: viewer not reachable',true);}
+  // annotated copy: the frame with detection boxes (if on) and a location caption
+  try{
+    const img=new Image(); img.src='/shots/'+m.name+'.jpg'; await img.decode();
+    const W=img.naturalWidth, H=img.naturalHeight, k=W/1280, c=document.createElement('canvas'); c.width=W; c.height=H;
+    const g=c.getContext('2d'); g.drawImage(img,0,0);
+    const list=m.detections.map(d=>[d.class,d.score,...d.box]);
+    if(m.detection_on)drawBoxes(g,list,W,H,k);
+    const dir=m.heading_deg==null?'':' '+DIRS[Math.round(((m.heading_deg%360)+360)%360/45)%8];
+    const where=m.gps_fix?Math.abs(m.lat).toFixed(6)+'° '+(m.lat>=0?'N':'S')+', '+Math.abs(m.lon).toFixed(6)+'° '+(m.lon>=0?'E':'W'):'no GPS fix';
+    const cnt=k2=>list.filter(x=>x[0]===k2).length;
+    const found=!m.detection_on?'':' · '+(list.length?[cnt('pothole')&&cnt('pothole')+' pothole'+(cnt('pothole')>1?'s':''),cnt('crack')&&cnt('crack')+' crack'+(cnt('crack')>1?'s':'')].filter(Boolean).join(', '):'no damage found');
+    const cap='Raven 2 · '+m.time+' · '+where+(m.alt_m!=null?' · alt '+(+m.alt_m).toFixed(1)+' m':'')+(m.heading_deg!=null?' · hdg '+Math.round(m.heading_deg)+'°'+dir:'')+found;
+    const ch=Math.round(26*k); g.fillStyle='rgba(8,10,14,.68)'; g.fillRect(0,H-ch,W,ch);
+    g.fillStyle='#eef1f5'; g.font='600 '+Math.round(14*k)+'px -apple-system,system-ui,sans-serif'; g.textBaseline='middle'; g.fillText(cap,10*k,H-ch/2);
+    const blob=await new Promise(r=>c.toBlob(r,'image/jpeg',.92));
+    await fetch('/screenshot/'+m.name+'/annotated',{method:'POST',body:blob});
+  }catch(e){}
+  toast('Saved '+m.name+(m.gps_fix?' · '+(+m.lat).toFixed(5)+', '+(+m.lon).toFixed(5):' · no GPS fix')+(m.detection_on?' · '+m.detections.length+' detection'+(m.detections.length===1?'':'s'):''));
+  pollMap();
+}
+$('shot').onclick=takeShot;
+document.addEventListener('keydown',e=>{if(e.metaKey||e.ctrlKey||e.altKey)return;
+  if(e.key==='s'||e.key==='S')takeShot(); if((e.key==='d'||e.key==='D')&&!$('det').hidden)detToggle();});
 $('full').onclick=()=>document.fullscreenElement?document.exitFullscreen():$('wrap').requestFullscreen();
 let idle;document.addEventListener('mousemove',()=>{$('wrap').classList.add('active');clearTimeout(idle);idle=setTimeout(()=>$('wrap').classList.remove('active'),2500);});
 $('video').onerror=()=>setTimeout(()=>$('video').src='/stream.mjpg?'+Date.now(),1000);
@@ -682,6 +949,16 @@ def make_handler(cam):
                 self._send(200, "application/json", json.dumps(cam.status()).encode())
             elif path == "/map":
                 self._send(200, "application/json", json.dumps(cam.map_data()).encode())
+            elif path == "/detections":
+                body = cam.detector.status() if cam.detector else {"on": False}
+                self._send(200, "application/json", json.dumps(body).encode())
+            elif path.startswith("/shots/") and path.endswith(".jpg") and SHOT_NAME.fullmatch(path[7:-4]):
+                f = os.path.join(SHOTS, path[7:])
+                if os.path.exists(f):
+                    with open(f, "rb") as fh:
+                        self._send(200, "image/jpeg", fh.read())
+                else:
+                    self._send(404, "text/plain", b"no such screenshot")
             elif path == "/frame.jpg":
                 if cam.frame:
                     self._send(200, "image/jpeg", cam.frame)
@@ -709,6 +986,24 @@ def make_handler(cam):
 
         def do_POST(self):
             path = self.path.split("?")[0]
+            parts = path.split("/")
+            if path in ("/detect/on", "/detect/off") and cam.detector:
+                cam.detector.start() if path.endswith("on") else cam.detector.stop()
+                return self._send(200, "application/json", json.dumps(cam.detector.status()).encode())
+            if path == "/screenshot" and not cam.library:
+                meta = save_screenshot(cam)
+                if not meta:
+                    return self._send(409, "application/json", b'{"error": "no video yet"}')
+                return self._send(200, "application/json", json.dumps(meta).encode())
+            if len(parts) == 4 and parts[1] == "screenshot" and parts[3] == "annotated" \
+                    and SHOT_NAME.fullmatch(parts[2]) and os.path.exists(os.path.join(SHOTS, parts[2] + ".json")):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(n) if 0 < n <= 16_000_000 else b""
+                if not body.startswith(b"\xff\xd8"):
+                    return self._send(400, "text/plain", b"expected a JPEG")
+                with open(os.path.join(SHOTS, parts[2] + "_annotated.jpg"), "wb") as f:
+                    f.write(body)
+                return self._send(200, "application/json", b'{"ok": true}')
             if not cam.log:
                 self._send(409, "text/plain", b"recording is off in demo and replay")
             elif path == "/record/start":
@@ -766,6 +1061,7 @@ def main():
         signal.signal(sig, interrupt)
 
     cam = Camera(ip, start_msg)
+    cam.detector = LiveDetector(cam)
     WifiSignal(cam).start()
     if not args.demo:
         cam.log = FlightLog(RECORDINGS, TELEMETRY_FIELDS + ("rssi_dbm",),
@@ -789,6 +1085,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        cam.detector.stop()
         cam.stop()
         if tel:
             tel.close()
@@ -811,6 +1108,7 @@ def serve_replay(args):
     else:
         folder = os.path.abspath(args.replay)
         cam.replay = os.path.basename(folder)
+        cam.detector = LiveDetector(cam)
         Replay(cam, folder, speed=args.speed, loop=args.loop).start()
         what = "Replaying " + cam.replay
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(cam))
@@ -822,6 +1120,8 @@ def serve_replay(args):
     except KeyboardInterrupt:
         pass
     finally:
+        if cam.detector:
+            cam.detector.stop()
         cam.running = False
         with cam.cond:
             cam.cond.notify_all()

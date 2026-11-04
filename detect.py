@@ -8,7 +8,9 @@ As a module (the viewer uses this):
 
 From the command line (TensorFlow environment):
     ~/PotholeRecognitionModel/tf_env/bin/python detect.py IMAGE_OR_FOLDER... [--out results/]
-    ~/PotholeRecognitionModel/tf_env/bin/python detect.py recordings/<name> --out results/
+    ~/PotholeRecognitionModel/tf_env/bin/python detect.py recordings/<name> --out results/ --drone
+--drone adds the haze/glare correction and square sections used for the
+drone's own camera (detect_worker.py does the same for the live viewer).
 Writes copies of the images with boxes drawn (red = pothole, yellow = crack)
 and prints what was found.
 """
@@ -52,6 +54,40 @@ class Detector(object):
             return []
         return self.detect_rgb(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
+    def detect_drone(self, bgr):
+        """For the drone's own camera: contrast correction for its haze and
+        glare, then the model on square sections of the frame (the left,
+        middle and right of a 16:9 image) so nothing is squashed. Overlapping
+        repeats from neighbouring sections are merged."""
+        rgb = cv2.cvtColor(enhance(bgr), cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        s = min(h, w)
+        xs = sorted({0, (w - s) // 2, w - s})
+        ys = sorted({0, (h - s) // 2, h - s})
+        found = []
+        for x in xs:
+            for y in ys:
+                found += [(c, sc, x0 + x, y0 + y, x1 + x, y1 + y)
+                          for c, sc, x0, y0, x1, y1 in self.detect_rgb(rgb[y:y + s, x:x + s])]
+        found.sort(key=lambda d: -d[1])
+        keep = []
+        for d in found:
+            if all(k[0] != d[0] or dm.iou(k[2:], d[2:]) < 0.3 for k in keep):
+                keep.append(d)
+        return keep
+
+
+def enhance(bgr):
+    """Even out the drone camera's bright haze/glare and boost local contrast.
+    The brightness map is worked out on a small copy, so this takes a few ms."""
+    h, w = bgr.shape[:2]
+    small = cv2.resize(bgr, (max(1, w // 8), max(1, h // 8)), interpolation=cv2.INTER_AREA).astype(np.float32)
+    glow = cv2.resize(cv2.GaussianBlur(small, (0, 0), small.shape[1] / 12), (w, h), interpolation=cv2.INTER_LINEAR)
+    flat = np.clip(bgr / np.maximum(glow, 1) * 128, 0, 255).astype(np.uint8)
+    lab = cv2.cvtColor(flat, cv2.COLOR_BGR2LAB)
+    lab[..., 0] = cv2.createCLAHE(2.5, (8, 8)).apply(lab[..., 0])
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
 
 def draw(bgr, dets):
     for cls, score, x0, y0, x1, y1 in dets:
@@ -87,6 +123,8 @@ def main():
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--threshold", type=float, default=0.35)
     ap.add_argument("--out", help="folder for images with boxes drawn")
+    ap.add_argument("--drone", action="store_true",
+                    help="drone-camera mode: haze/glare correction and square sections (as the live viewer uses)")
     args = ap.parse_args()
     det = Detector(args.model, args.threshold)
     if args.out:
@@ -97,7 +135,7 @@ def main():
         bgr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
         if bgr is None:
             continue
-        dets = det.detect_rgb(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+        dets = det.detect_drone(bgr) if args.drone else det.detect_rgb(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         n += 1
         found += bool(dets)
         if dets:

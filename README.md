@@ -87,6 +87,18 @@ away when everything is ready or the motors unlock.
   slower. The test-set report is written to `models/road_damage/report.txt`.
 - Try it: `~/PotholeRecognitionModel/tf_env/bin/python detect.py ~/Downloads/RoadDamage/test --out results`
   (or a `recordings/<name>` folder) draws boxes and prints what it found; ~12-25 ms per frame.
+  Add `--drone` for the drone's own camera (haze/glare correction + square sections, ~45 ms per frame).
+
+## Live detection and screenshots (viewer buttons)
+- **DETECT** (or `D`): runs the model on the live video, frame by frame, and draws boxes
+  (red = pothole, yellow = crack). It starts `detect_worker.py` with the TensorFlow Python
+  (`~/PotholeRecognitionModel/tf_env/bin/python`, override with `RAVEN_TF_PYTHON`) and stops it when
+  switched off. It only reads frames already received; nothing is sent to the drone.
+- **SHOT** (or `S`): saves the current frame to `drone_screenshots/` with where it was taken:
+  `<time>.jpg` (raw frame), `<time>_annotated.jpg` (location caption, plus boxes if DETECT is on),
+  `<time>.json` (GPS, altitude, heading, detections, Google Maps link), and `screenshots.kml` /
+  `screenshots.geojson` with a pin per screenshot (open the KML in Google Earth). Screenshots show as
+  purple dots on the live map. The folder holds GPS locations, so it is kept out of git.
 
 ## Files
 | File | Purpose |
@@ -106,6 +118,7 @@ away when everything is ready or the motors unlock.
 | `damage_model.py` | Detector model, targets, loss, decoding, scoring |
 | `train_detector.py` | Trains the detector from scratch |
 | `detect.py` | Runs the detector on images or recordings |
+| `detect_worker.py` | Detector helper process for the viewer's DETECT toggle |
 | `link_report.py` | Link quality versus distance for a recording |
 | `wifi_signal.swift` | Reads the Mac's Wi-Fi signal strength |
 
