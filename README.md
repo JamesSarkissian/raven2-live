@@ -47,8 +47,22 @@ away when everything is ready or the motors unlock.
   Imagery: Esri World Imagery; streets: OpenStreetMap.
 - `./live_viewer.py --replay recordings/<name> [--speed 2] [--loop]` plays a recording
   through the viewer without connecting to the drone.
-- `./fake_drone.py FRAMES_DIR [UDP_TEXT]` imitates the drone on this Mac for testing:
+- `./fake_drone.py FRAMES_DIR [UDP_TEXT] [--stall 4 --every 10]` imitates the drone (optionally with a weak link) on this Mac for testing:
   run it, then `./live_viewer.py 127.0.0.1 --port 8766`.
+
+## Video link
+- Top left shows the link: **green** = smooth video, **amber** = weak (under 8 fps, frozen
+  video or the Mac's Wi-Fi below -70 dBm), **red** = no video. It reads e.g. `14 fps · -52 dBm`,
+  or `video frozen 3 s` when frames stop. Signal strength comes from `wifi_signal.swift`
+  (CoreWLAN, read-only), compiled into `.build/` on first run and recorded with each flight.
+- The video reader rides out weak patches: partial frames are kept, heartbeats keep going,
+  and it only reconnects after 8 s of silence.
+- `--sd` asks the camera for standard-definition video (same start message with the HD
+  flag 0), which may hold up better at range.
+- `./link_report.py recordings/<name>` shows fps, video/data gaps, distance, altitude and
+  signal strength every 5 s, to see where the link starts failing.
+- Tips: keep the laptop raised with a clear line of sight to the drone; flying only 1–2 m
+  up weakens Wi-Fi a lot. On 2 Nov video fell below 0.5 fps past ~12 m at 1–2 m altitude.
 
 `./live_viewer.py --demo` previews the overlay with simulated values; `--no-telemetry` is video only.
 
@@ -65,6 +79,8 @@ away when everything is ready or the motors unlock.
 | `recorder.py` | Flight recorder, replay and GPS track |
 | `fake_drone.py` | Imitates the drone locally for testing |
 | `player_page.py` | Recordings page (player and satellite map) |
+| `link_report.py` | Link quality versus distance for a recording |
+| `wifi_signal.swift` | Reads the Mac's Wi-Fi signal strength |
 
 Captures and recordings (`capture_*/`, `stream_*/`, `probe_*/`, `recordings/`) are git-ignored: they contain
 GPS location and camera images.

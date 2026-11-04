@@ -45,6 +45,7 @@ def build(cmd, arg1=0):
 
 
 START = build(CMD_START, 1)    # arg1=1 asks for high definition
+START_SD = build(CMD_START, 0)  # same request, standard definition (lighter on weak Wi-Fi)
 HEARTBEAT = build(CMD_HEARTBEAT)
 STOP = build(CMD_STOP)
 

@@ -13,3 +13,6 @@ recordings/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Built helpers
+.build/

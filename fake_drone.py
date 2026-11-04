@@ -25,7 +25,9 @@ MAGIC = b"lewei_cmd\x00"
 DRONE_SRC = "192.168.0.1:50000"
 
 
-def serve_video(frames_dir):
+def serve_video(frames_dir, stall=0.0, every=0.0):
+    """stall/every: every `every` seconds, freeze for `stall` seconds in the
+    middle of a frame, like a weak Wi-Fi link."""
     frames = [open(f, "rb").read() for f in sorted(glob.glob(os.path.join(frames_dir, "frame_*.jpg")))]
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -34,12 +36,22 @@ def serve_video(frames_dir):
     while True:
         conn, _ = srv.accept()
         i = 0
+        next_stall = time.time() + every
         try:
             while True:
                 f = frames[i % len(frames)]
                 i += 1
                 body = struct.pack("<LLQL", 0, len(f), i, 0) + b"\0" * 12 + f
-                conn.sendall(MAGIC + struct.pack("<9I", 257, 0, 0, len(body), 0, 0, 0, 0, 0) + body)
+                msg = MAGIC + struct.pack("<9I", 257, 0, 0, len(body), 0, 0, 0, 0, 0) + body
+                if stall and time.time() >= next_stall:
+                    half = len(msg) // 2
+                    conn.sendall(msg[:half])
+                    print("stalling %.0f s mid-frame" % stall, flush=True)
+                    time.sleep(stall)
+                    conn.sendall(msg[half:])
+                    next_stall = time.time() + every
+                else:
+                    conn.sendall(msg)
                 time.sleep(1 / 15)
         except OSError:
             conn.close()
@@ -79,8 +91,10 @@ def main():
     ap.add_argument("udp_text", nargs="?")
     ap.add_argument("--start", type=float, default=0, help="seconds into the capture")
     ap.add_argument("--speed", type=float, default=1.0)
+    ap.add_argument("--stall", type=float, default=0, help="freeze video this long...")
+    ap.add_argument("--every", type=float, default=10, help="...every this many seconds")
     args = ap.parse_args()
-    threading.Thread(target=serve_video, args=(args.frames,), daemon=True).start()
+    threading.Thread(target=serve_video, args=(args.frames, args.stall, args.every), daemon=True).start()
     if args.udp_text:
         serve_telemetry(args.udp_text, args.start, args.speed)
     while True:

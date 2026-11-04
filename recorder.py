@@ -340,6 +340,8 @@ class Replay(threading.Thread):
                     if time.time() - fps_t >= 1:
                         self.cam.fps, count, fps_t = count / (time.time() - fps_t), 0, time.time()
                 else:
+                    if "rssi_dbm" in data:
+                        self.cam.rssi = data["rssi_dbm"]
                     self.cam.set_telemetry(**data)
             if not self.loop:
                 break

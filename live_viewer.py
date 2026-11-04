@@ -24,6 +24,7 @@ import math
 import os
 import signal
 import socket
+import subprocess
 import struct
 import sys
 import threading
@@ -33,7 +34,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from lw_unscramble import unscramble
 from stream_test import (CMD_HEARTBEAT, CMD_RET_STREAM, DRONE_IP, HDR_LEN,
-                         HEARTBEAT, HEARTBEAT_EVERY, MAGIC, START, STOP,
+                         HEARTBEAT, HEARTBEAT_EVERY, MAGIC, START, START_SD, STOP,
                          VIDEO_PORT, recv_exact)
 import telemetry as tm
 from player_page import PLAYER_PAGE
@@ -46,15 +47,22 @@ TELEMETRY_FIELDS = ("battery_pct", "battery_v", "alt_m", "dist_m",
                     "sats", "gps_fix", "roll_deg", "pitch_deg", "yaw_deg",
                     "state")
 BATTERY_WINDOW = 5   # seconds; battery % shown is the lowest raw value in this window
+STALL_RECONNECT = 8.0   # seconds without any video data before reconnecting
+MAX_MESSAGE = 4_000_000 # bigger "frames" mean the stream is out of step
+HERE = os.path.dirname(os.path.abspath(__file__))
 RECORDINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 
 
 class Camera(threading.Thread):
     """Keeps one stream connection to the drone and holds the latest frame."""
 
-    def __init__(self, ip):
+    def __init__(self, ip, start_msg=START):
         super().__init__(daemon=True)
         self.ip = ip
+        self.start_msg = start_msg
+        self.frame_times = deque()  # arrival times over the last 2 s, for fps
+        self.last_frame_t = 0.0
+        self.rssi = self.noise = self.tx_rate = None   # the Mac's Wi-Fi link
         self.cond = threading.Condition()
         self.frame = None
         self.seq = 0
@@ -79,38 +87,63 @@ class Camera(threading.Thread):
                 self.error = str(e)
             self.connected = False
             if self.running:
-                time.sleep(2)   # drone out of range or rebooting; retry
+                time.sleep(1)   # drone out of range or rebooting; retry
 
     def _stream(self):
+        """Read the camera stream. Slow or patchy Wi-Fi is expected: partial
+        frames are kept across pauses, heartbeats go out on time even when no
+        data arrives, and it only reconnects after STALL_RECONNECT of silence."""
         self._sock = sock = socket.create_connection((self.ip, VIDEO_PORT), timeout=5)
         try:
-            sock.sendall(START)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+            sock.settimeout(1.0)
+            sock.sendall(self.start_msg)
             self.connected, self.error = True, ""
-            last_hb = t0 = time.time()
-            count = 0
+            buf = bytearray()
+            last_hb = last_data = time.time()
             while self.running:
-                hdr = recv_exact(sock, HDR_LEN)
-                if hdr[:len(MAGIC)] != MAGIC:
-                    raise ValueError("lost sync with camera stream")
-                ints = struct.unpack_from("<9I", hdr, len(MAGIC))
-                body = recv_exact(sock, ints[3])
-                if ints[0] == CMD_RET_STREAM and len(body) >= 32:
-                    _, size, _, _ = struct.unpack_from("<LLQL", body)
-                    frame = bytearray(body[32:32 + size])
-                    if ints[4] == 129:
-                        unscramble(frame, ints[5], ints[6])
-                    self.publish_frame(bytes(frame))
-                    count += 1
-                    if time.time() - t0 >= 1:
-                        self.fps, count, t0 = count / (time.time() - t0), 0, time.time()
-                elif ints[0] != CMD_HEARTBEAT:
-                    pass    # unknown message types are ignored
-                if time.time() - last_hb >= HEARTBEAT_EVERY:
+                self._parse(buf)
+                now = time.time()
+                if now - last_hb >= HEARTBEAT_EVERY:
                     sock.sendall(HEARTBEAT)
-                    last_hb = time.time()
+                    last_hb = now
+                try:
+                    chunk = sock.recv(65536)
+                except socket.timeout:
+                    chunk = None
+                if chunk == b"":
+                    raise ConnectionError("camera closed the connection")
+                if chunk:
+                    buf += chunk
+                    last_data = time.time()
+                elif time.time() - last_data > STALL_RECONNECT:
+                    raise ConnectionError("no video for %d s" % STALL_RECONNECT)
             sock.sendall(STOP)
         finally:
             sock.close()
+
+    def _parse(self, buf):
+        """Take every complete message out of buf; resync if out of step."""
+        while len(buf) >= HDR_LEN:
+            if buf[:len(MAGIC)] != MAGIC:
+                i = buf.find(MAGIC, 1)
+                del buf[:i if i > 0 else len(buf) - len(MAGIC) + 1]
+                continue
+            ints = struct.unpack_from("<9I", buf, len(MAGIC))
+            if ints[3] > MAX_MESSAGE:
+                del buf[:1]
+                continue
+            end = HDR_LEN + ints[3]
+            if len(buf) < end:
+                return
+            body = bytes(buf[HDR_LEN:end])
+            del buf[:end]
+            if ints[0] == CMD_RET_STREAM and len(body) >= 32:
+                _, size, _, _ = struct.unpack_from("<LLQL", body)
+                frame = bytearray(body[32:32 + size])
+                if ints[4] == 129:
+                    unscramble(frame, ints[5], ints[6])
+                self.publish_frame(bytes(frame))
 
     def stop(self):
         self.running = False
@@ -122,6 +155,8 @@ class Camera(threading.Thread):
                 pass
 
     def publish_frame(self, jpeg):
+        now = self.last_frame_t = time.time()
+        self.frame_times.append(now)
         with self.cond:
             self.frame = jpeg
             self.seq += 1
@@ -135,7 +170,17 @@ class Camera(threading.Thread):
         snapshot = dict(self.telemetry)
         self.track.update(snapshot, now)
         if self.log:
+            snapshot["rssi_dbm"] = self.rssi
             self.log.telemetry(snapshot, now)
+
+    def link(self):
+        """Video rate over the last 2 s, time since the last frame, Mac Wi-Fi."""
+        now = time.time()
+        while self.frame_times and now - self.frame_times[0] > 2:
+            self.frame_times.popleft()
+        return {"fps": round(len(self.frame_times) / 2, 1),
+                "frame_age": round(now - self.last_frame_t, 1) if self.last_frame_t else None,
+                "rssi": self.rssi, "noise": self.noise, "tx_rate": self.tx_rate}
 
     def map_data(self):
         t = self.telemetry
@@ -148,10 +193,45 @@ class Camera(threading.Thread):
 
     def status(self):
         return {"connected": self.connected, "error": self.error,
-                "fps": round(self.fps, 1), "frames": self.seq,
+                "fps": self.link()["fps"] if not self.replay else round(self.fps, 1),
+                "link": self.link(), "frames": self.seq,
                 "demo": self.demo, "telemetry": self.telemetry, "replay": self.replay,
                 "log": self.log.status() if self.log else None,
                 "telemetry_age": round(time.time() - self.tel_time, 1) if self.tel_time else None}
+
+
+class WifiSignal(threading.Thread):
+    """Reads the Mac's Wi-Fi signal once a second via the wifi_signal helper
+    (CoreWLAN, read-only). Compiled on first use; skipped if that fails."""
+
+    def __init__(self, cam):
+        super().__init__(daemon=True)
+        self.cam = cam
+
+    def _helper(self):
+        src = os.path.join(HERE, "wifi_signal.swift")
+        exe = os.path.join(HERE, ".build", "wifi_signal")
+        if not os.path.exists(exe) or os.path.getmtime(exe) < os.path.getmtime(src):
+            os.makedirs(os.path.dirname(exe), exist_ok=True)
+            subprocess.run(["swiftc", "-O", src, "-o", exe], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return exe
+
+    def run(self):
+        try:
+            proc = subprocess.Popen([self._helper()], stdout=subprocess.PIPE, text=True)
+        except (OSError, subprocess.CalledProcessError):
+            return      # no Swift compiler: the readout just omits signal strength
+        for line in proc.stdout:
+            if not self.cam.running:
+                break
+            parts = line.split()
+            if len(parts) == 3:
+                self.cam.rssi, self.cam.noise = int(parts[0]), int(parts[1])
+                self.cam.tx_rate = float(parts[2])
+            else:
+                self.cam.rssi = self.cam.noise = self.cam.tx_rate = None
+        proc.terminate()
 
 
 class Telemetry(threading.Thread):
@@ -238,8 +318,9 @@ PAGE = """<!doctype html>
 /* top-left: link + battery (most important) */
 #tl{top:10px;left:10px;display:flex;align-items:center;gap:10px}
 .dot{width:8px;height:8px;border-radius:50%;background:var(--bad);display:inline-block}
-.on .dot{background:var(--ok)}
-#fps{color:var(--dim);font-size:11px}
+.on .dot{background:var(--ok)}.weak .dot{background:var(--warn)}
+#fps{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+#fps.frozen{color:var(--warn);font-weight:600}
 #bat{display:flex;align-items:center;gap:6px;font-size:15px}
 #batbar{width:26px;height:12px;border:1.5px solid var(--dim);border-radius:3px;padding:1px;position:relative}
 #batbar:after{content:"";position:absolute;right:-4px;top:3px;width:2px;height:4px;background:var(--dim);border-radius:1px}
@@ -339,9 +420,16 @@ const len=v=>v==null?null:(imperial?num(v*3.28084,0)+'<span class=u>ft</span>':n
 const spd=v=>v==null?null:(imperial?num(v*2.23694,1)+'<span class=u>mph</span>':num(v,1)+'<span class=u>m/s</span>');
 const deg=v=>v==null?null:num(v,0)+'°';
 function render(s){
-  $('link').className=s.connected?'on':'';
-  $('link').title=s.connected?'Camera connected':(s.error||'Not connected');
-  $('fps').textContent=s.connected?s.fps+' fps':(s.error?'reconnecting…':'offline');
+  // link quality: green = smooth video, amber = weak, red = no video
+  const L=s.link||{}, age=L.frame_age, frozen=s.connected&&age!=null&&age>1.5;
+  const weak=frozen||(L.fps!=null&&L.fps<8)||(L.rssi!=null&&L.rssi<-70);
+  $('link').className=!s.connected||(age!=null&&age>5)?'':weak?'weak':'on';
+  const sig=L.rssi!=null?' · '+L.rssi+' dBm':'';
+  $('fps').textContent=!s.connected?(s.error?'reconnecting…':'offline')+sig
+    :frozen?'video frozen '+Math.round(age)+' s'+sig:s.fps+' fps'+sig;
+  $('fps').className=frozen?'frozen':'';
+  $('link').title=s.connected?'Camera connected'+(L.rssi!=null?' · Mac Wi-Fi '+L.rssi+' dBm (noise '+L.noise+' dBm, '+L.tx_rate+' Mbps)':'')
+    +' · above -60 dBm is strong, below -70 dBm video starts dropping':(s.error||'Not connected');
   $('empty').style.display=s.frames?'none':'';
   const t=s.telemetry, have=Object.values(t).some(v=>v!=null);
   const stale=have&&(s.telemetry_age==null||s.telemetry_age>3);
@@ -643,6 +731,8 @@ def main():
     ap.add_argument("--port", type=int, default=HTTP_PORT, help="local web page port")
     ap.add_argument("--no-telemetry", action="store_true",
                     help="video only; do not request flight data")
+    ap.add_argument("--sd", action="store_true",
+                    help="ask the camera for standard-definition video (lighter on weak Wi-Fi)")
     ap.add_argument("--no-auto-record", action="store_true",
                     help="do not start recording when the motors unlock")
     ap.add_argument("--replay", metavar="FOLDER",
@@ -657,7 +747,8 @@ def main():
         return serve_replay(args)
     print("This viewer sends only these messages:")
     print(" video, TCP %s:%d" % (ip, VIDEO_PORT))
-    print("  start stream, once:   ", START.hex(" "))
+    start_msg = START_SD if args.sd else START
+    print("  start stream, once:   ", start_msg.hex(" "), "(standard definition)" if args.sd else "")
     print("  heartbeat, every 1 s: ", HEARTBEAT.hex(" "))
     print("  stop stream, at end:  ", STOP.hex(" "))
     use_tel = not (args.no_telemetry or args.demo)
@@ -674,9 +765,10 @@ def main():
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, interrupt)
 
-    cam = Camera(ip)
+    cam = Camera(ip, start_msg)
+    WifiSignal(cam).start()
     if not args.demo:
-        cam.log = FlightLog(RECORDINGS, TELEMETRY_FIELDS,
+        cam.log = FlightLog(RECORDINGS, TELEMETRY_FIELDS + ("rssi_dbm",),
                             auto_record=not args.no_auto_record)
     cam.start()
     if args.demo:
