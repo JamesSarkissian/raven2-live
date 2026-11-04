@@ -66,6 +66,15 @@ away when everything is ready or the motors unlock.
 
 `./live_viewer.py --demo` previews the overlay with simulated values; `--no-telemetry` is video only.
 
+## Training data
+- `./fetch_rdd2022.py China_Drone United_States` downloads just those folders of the
+  RDD2022 road-damage dataset ([paper](https://arxiv.org/abs/2209.08538),
+  [Figshare](https://figshare.com/articles/dataset/21431547), CC BY 4.0 / CC BY-SA 4.0)
+  into `~/Downloads/RDD2022`, using ranged downloads instead of the full 13 GB file.
+- `./build_dataset.py` merges it with `~/Downloads/Pothole` into `~/Downloads/RoadDamage`
+  (hard links, so no extra disk space): classes `pothole` and `crack` (D00/D10/D20),
+  original RDD2022 code kept in `subtype`; RDD2022 "Repair" and "Block crack" boxes are left out.
+
 ## Files
 | File | Purpose |
 |---|---|
@@ -79,6 +88,8 @@ away when everything is ready or the motors unlock.
 | `recorder.py` | Flight recorder, replay and GPS track |
 | `fake_drone.py` | Imitates the drone locally for testing |
 | `player_page.py` | Recordings page (player and satellite map) |
+| `fetch_rdd2022.py` | Downloads chosen RDD2022 folders |
+| `build_dataset.py` | Merges pothole + RDD2022 into one training set |
 | `link_report.py` | Link quality versus distance for a recording |
 | `wifi_signal.swift` | Reads the Mac's Wi-Fi signal strength |
 
