@@ -75,6 +75,19 @@ away when everything is ready or the motors unlock.
   (hard links, so no extra disk space): classes `pothole` and `crack` (D00/D10/D20),
   original RDD2022 code kept in `subtype`; RDD2022 "Repair" and "Block crack" boxes are left out.
 
+## Pothole and crack detector (trained from scratch)
+- `damage_model.py`: a small CenterNet-style detector (1.5 M parameters, random start, no
+  pre-trained weights). It predicts a heatmap peaking at each pothole/crack centre plus box size.
+- Train (about 6.5 minutes per epoch on an M4 CPU, ~6.5 hours for the default 60 epochs):
+
+      cd ~/droneRE && ~/PotholeRecognitionModel/tf_env/bin/python train_detector.py
+
+  It prints time remaining, checks validation mAP every 5 epochs, keeps `models/road_damage/best.keras`,
+  and resumes where it stopped if you run the same command again. `--input 320` is sharper but ~1.5x
+  slower. The test-set report is written to `models/road_damage/report.txt`.
+- Try it: `~/PotholeRecognitionModel/tf_env/bin/python detect.py ~/Downloads/RoadDamage/test --out results`
+  (or a `recordings/<name>` folder) draws boxes and prints what it found; ~12-25 ms per frame.
+
 ## Files
 | File | Purpose |
 |---|---|
@@ -90,6 +103,9 @@ away when everything is ready or the motors unlock.
 | `player_page.py` | Recordings page (player and satellite map) |
 | `fetch_rdd2022.py` | Downloads chosen RDD2022 folders |
 | `build_dataset.py` | Merges pothole + RDD2022 into one training set |
+| `damage_model.py` | Detector model, targets, loss, decoding, scoring |
+| `train_detector.py` | Trains the detector from scratch |
+| `detect.py` | Runs the detector on images or recordings |
 | `link_report.py` | Link quality versus distance for a recording |
 | `wifi_signal.swift` | Reads the Mac's Wi-Fi signal strength |
 
