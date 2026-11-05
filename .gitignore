@@ -21,3 +21,4 @@ models/
 # Screenshots: camera images with GPS location
 drone_screenshots/
 screenshots/
+dataset/

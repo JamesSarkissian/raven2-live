@@ -99,6 +99,17 @@ away when everything is ready or the motors unlock.
   `<time>.json` (GPS, altitude, heading, detections, Google Maps link), and `screenshots.kml` /
   `screenshots.geojson` with a pin per screenshot (open the KML in Google Earth). Screenshots show as
   purple dots on the live map. The folder holds GPS locations, so it is kept out of git.
+- **REC** (or `R`): records the camera video, flight data and GPS path to `recordings/<time>/`
+  (it also starts by itself when the motors unlock). If DETECT is on while recording, every box the
+  model finds is saved too, in `detections.csv` with time and GPS position, and REC shows the count.
+
+## Collecting more training data
+1. Fly over potholes with REC on (DETECT on as well, so the frames with potholes are marked).
+2. `python3 extract_frames.py recordings/<name> [more...]` saves a frame every second plus each frame
+   where the model found something to `dataset/drone/<name>/`, with `_annotations.csv` holding the
+   model's guesses in the training format (`--every 0.5` for more frames).
+3. Fix the boxes in a labelling tool (Roboflow or CVAT, "TensorFlow Object Detection CSV"), then
+   train with them. `dataset/` is kept out of git.
 
 ## Files
 | File | Purpose |
@@ -119,6 +130,7 @@ away when everything is ready or the motors unlock.
 | `train_detector.py` | Trains the detector from scratch |
 | `detect.py` | Runs the detector on images or recordings |
 | `detect_worker.py` | Detector helper process for the viewer's DETECT toggle |
+| `extract_frames.py` | Recordings to images + pre-filled labels for more training data |
 | `link_report.py` | Link quality versus distance for a recording |
 | `wifi_signal.swift` | Reads the Mac's Wi-Fi signal strength |
 

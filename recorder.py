@@ -7,6 +7,9 @@ A recording is a folder recordings/<YYYYmmdd_HHMMSS>/ holding:
   track.geojson   flight path (written when the recording stops)
   track.kml       the same path for Google Earth
   meta.json       start/stop time and summary
+  detections.csv  what the model found while DETECT was on (only then):
+                  t (detection time), frame_t (time of the frame it looked at),
+                  class, score, box corners as fractions of the frame, lat, lon, alt_m
 t is Unix time in seconds, so video and flight data line up for training
 and for placing detections on the map.
 """
@@ -155,6 +158,9 @@ class Recorder(object):
         self._tel = open(os.path.join(self.folder, "telemetry.csv"), "w", newline="")
         self._tcsv = csv.writer(self._tel)
         self._tcsv.writerow(["t"] + list(fields))
+        self._det = None        # detections.csv, opened on the first detection result
+        self.detected = 0       # frames the model looked at during this recording
+        self.found = {}         # class -> boxes found
         self._last_flush = time.time()
         self.closed = False
 
@@ -177,10 +183,30 @@ class Recorder(object):
             self.track.update(snapshot, t)
             self._maybe_flush()
 
+    def detections(self, t, frame_t, dets, tel):
+        """One model result (DETECT on): every box with where the drone was."""
+        with self.lock:
+            if self.closed:
+                return
+            if not self._det:
+                self._detf = open(os.path.join(self.folder, "detections.csv"), "w", newline="")
+                self._det = csv.writer(self._detf)
+                self._det.writerow(["t", "frame_t", "class", "score", "x0", "y0", "x1", "y1", "lat", "lon", "alt_m"])
+            self.detected += 1
+            where = [tel.get("lat"), tel.get("lon"), tel.get("alt_m")] if valid_fix(tel) else ["", "", tel.get("alt_m")]
+            where = ["" if v is None else v for v in where]
+            for c, score, x0, y0, x1, y1 in dets:
+                self._det.writerow(["%.3f" % t, "%.3f" % frame_t, c, score, x0, y0, x1, y1] + where)
+                self.found[c] = self.found.get(c, 0) + 1
+            self._maybe_flush()
+
+    def _files(self):
+        return [self._video, self._fidx, self._tel] + ([self._detf] if self._det else [])
+
     def _maybe_flush(self):
         # flush every 2 s so a crash or dead battery loses little
         if time.time() - self._last_flush > 2:
-            for f in (self._video, self._fidx, self._tel):
+            for f in self._files():
                 f.flush()
             self._last_flush = time.time()
 
@@ -189,7 +215,7 @@ class Recorder(object):
             if self.closed:
                 return
             self.closed = True
-            for f in (self._video, self._fidx, self._tel):
+            for f in self._files():
                 f.close()
         self.track.write(self.folder, self.name)
         with open(os.path.join(self.folder, "meta.json"), "w") as f:
@@ -197,12 +223,13 @@ class Recorder(object):
                        "frames": self.frames, "video_bytes": self.bytes,
                        "track_points": len(self.track.points),
                        "track_length_m": round(self.track.length_m(), 1),
-                       "auto_started": self.auto}, f, indent=1)
+                       "auto_started": self.auto,
+                       "detection_frames": self.detected, "detections": self.found}, f, indent=1)
 
     def status(self):
         return {"active": not self.closed, "name": self.name, "auto": self.auto,
                 "elapsed": round(time.time() - self.start, 1), "frames": self.frames,
-                "mb": round(self.bytes / 1e6, 1)}
+                "mb": round(self.bytes / 1e6, 1), "detections": dict(self.found)}
 
 
 class FlightLog(object):
@@ -239,6 +266,11 @@ class FlightLog(object):
         rec = self.rec
         if rec:
             rec.frame(jpeg, t)
+
+    def detections(self, t, frame_t, dets, tel):
+        rec = self.rec
+        if rec:
+            rec.detections(t, frame_t, dets, tel)
 
     def telemetry(self, snapshot, t):
         rec = self.rec

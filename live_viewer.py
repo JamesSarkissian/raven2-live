@@ -349,7 +349,7 @@ class LiveDetector(object):
             while self._alive(gen):
                 with cam.cond:
                     cam.cond.wait_for(lambda: cam.seq != seen or not self._alive(gen), timeout=1)
-                    frame, seq = cam.frame, cam.seq
+                    frame, seq, frame_t = cam.frame, cam.seq, cam.last_frame_t
                 if not self._alive(gen) or seq == seen or not frame:
                     continue
                 seen = seq
@@ -366,6 +366,8 @@ class LiveDetector(object):
                     self.times.popleft()
                 if self.gen == gen:
                     self.result = r
+                    if cam.log:     # recording: keep what was found, with the GPS position
+                        cam.log.detections(now, frame_t or now, r["dets"], dict(cam.telemetry))
         except (OSError, ValueError) as e:
             if self.gen == gen:
                 self.error, self.on, self.ready = str(e), False, False
@@ -719,8 +721,10 @@ function recRender(s){
   const b=$('rec'); b.hidden=!s.log;
   if(!s.log)return;
   const r=s.log.recording; b.classList.toggle('on',!!r);
-  b.textContent=r?'REC '+mmss(r.elapsed):'REC';
-  b.title=r?('Recording '+r.name+(r.auto?' (started on unlock)':'')+' · '+r.mb+' MB · click to stop')
+  const f=r&&r.detections||{}, nf=(f.pothole||0)+(f.crack||0);
+  b.textContent=r?'REC '+mmss(r.elapsed)+(nf?' · '+nf+' found':''):'REC';
+  b.title=r?('Recording '+r.name+(r.auto?' (started on unlock)':'')+' · '+r.mb+' MB'
+             +(detOn?' · detections saved too':' · turn DETECT on to also save detections')+' · click to stop (R)')
           :'Record video, flight data and GPS path (R)'+(s.log.auto_record?' · starts by itself when motors unlock':'');
 }
 async function recToggle(){
