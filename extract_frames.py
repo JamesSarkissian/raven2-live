@@ -2,6 +2,7 @@
 """Turn drone recordings into images for labelling (more training data).
 
     python3 extract_frames.py recordings/<name> [more recordings...] [--every 1.0] [--out dataset/drone]
+    python3 extract_frames.py recordings/2026110* --no-guesses      (to label everything yourself)
 
 For each recording it saves:
   - one frame every --every seconds (default 1 s), and
@@ -13,7 +14,11 @@ the model's guesses only: open them in a labelling tool (e.g. Roboflow or
 CVAT, "TensorFlow Object Detection CSV"), fix and add boxes, then train with
 the corrected file. Frames with no guesses get a row with empty box columns
 so they are still listed. frames.csv in each folder says when and where every
-image was taken.
+image was taken. --no-guesses saves only the regular frames, with no boxes,
+for labelling from scratch with label_tool.py.
+
+A folder that label_tool.py has already saved labels in is never overwritten
+(it is skipped), so running this again after new recordings is safe.
 
 Plain Python, no TensorFlow needed. Only reads the recordings.
 """
@@ -51,8 +56,12 @@ def read_rows(path):
         return list(csv.DictReader(f))
 
 
-def extract(folder, out_root, every, hit_gap):
+def extract(folder, out_root, every, hit_gap, guesses=True):
     name = os.path.basename(os.path.normpath(folder))
+    out = os.path.join(out_root, name)
+    if os.path.exists(os.path.join(out, "_labels.json")):
+        print("%s: already being labelled in %s, skipped" % (name, out))
+        return 0
     frames = [(float(r["t"]), int(r["offset"]), int(r["size"])) for r in read_rows(os.path.join(folder, "frames.csv"))]
     if not frames:
         print("%s: no frames, skipped" % name)
@@ -63,7 +72,7 @@ def extract(folder, out_root, every, hit_gap):
 
     # model results, grouped by the frame they were run on
     hits = {}
-    for r in read_rows(os.path.join(folder, "detections.csv")):
+    for r in read_rows(os.path.join(folder, "detections.csv")) if guesses else []:
         hits.setdefault(r["frame_t"], []).append(r)
 
     def nearest(t):
@@ -83,7 +92,6 @@ def extract(folder, out_root, every, hit_gap):
             chosen[j] = hits[ft]
             last_hit = float(ft)
 
-    out = os.path.join(out_root, name)
     os.makedirs(out, exist_ok=True)
     n_boxes = 0
     with open(os.path.join(folder, "video.mjpg"), "rb") as v, \
@@ -111,7 +119,7 @@ def extract(folder, out_root, every, hit_gap):
             k = bisect.bisect_right(tel_t, t) - 1
             r = tel[k] if k >= 0 else {}
             idx.writerow([fn, "%.3f" % t, r.get("lat", ""), r.get("lon", ""), r.get("alt_m", ""),
-                          r.get("heading", ""), len(boxes)])
+                          r.get("heading_deg", ""), len(boxes)])
     print("%s: %d images (%d with model guesses, %d boxes) -> %s"
           % (name, len(chosen), sum(1 for b in chosen.values() if b), n_boxes, out))
     return len(chosen)
@@ -124,8 +132,10 @@ def main():
     ap.add_argument("--hit-gap", type=float, default=0.5,
                     help="seconds between saved frames with detections (default 0.5)")
     ap.add_argument("--out", default=os.path.join(HERE, "dataset", "drone"))
+    ap.add_argument("--no-guesses", action="store_true",
+                    help="regular frames only, no model boxes (label everything yourself)")
     args = ap.parse_args()
-    total = sum(extract(r, args.out, args.every, args.hit_gap) for r in args.recordings)
+    total = sum(extract(r, args.out, args.every, args.hit_gap, not args.no_guesses) for r in args.recordings)
     print("%d images in all" % total)
 
 

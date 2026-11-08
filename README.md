@@ -104,12 +104,18 @@ away when everything is ready or the motors unlock.
   model finds is saved too, in `detections.csv` with time and GPS position, and REC shows the count.
 
 ## Collecting more training data
-1. Fly over potholes with REC on (DETECT on as well, so the frames with potholes are marked).
-2. `python3 extract_frames.py recordings/<name> [more...]` saves a frame every second plus each frame
-   where the model found something to `dataset/drone/<name>/`, with `_annotations.csv` holding the
-   model's guesses in the training format (`--every 0.5` for more frames).
-3. Fix the boxes in a labelling tool (Roboflow or CVAT, "TensorFlow Object Detection CSV"), then
-   train with them. `dataset/` is kept out of git.
+1. Record potholes and cracks with REC (flying, or holding the drone with the motors locked).
+2. Export frames: `python3 extract_frames.py recordings/<name> [more...] --no-guesses` saves one
+   frame per second to `dataset/drone/<name>/` (`--every 0.5` for more). Without `--no-guesses`,
+   frames where DETECT found something are added too, with the model's boxes pre-filled.
+   Folders you have started labelling are never overwritten, so re-running after new recordings is safe.
+3. Label: double-click **Raven 2 Labeller.command** (or `python3 label_tool.py`, then
+   http://localhost:8768). Drag to draw a box, `1` pothole / `2` crack, click a box to move or
+   resize it, Delete removes it, Enter = done and next, X = skip a bad frame, U = next unlabelled,
+   B = brighter, Cmd+Z = undo. "Done" with no boxes counts as road with no damage.
+   Every change is saved at once to `_labels.json` and `_annotations.csv` (finished images
+   only, in the training format). Images are never changed or deleted.
+4. `dataset/` is kept out of git (it holds GPS positions).
 
 ## Files
 | File | Purpose |
@@ -130,7 +136,8 @@ away when everything is ready or the motors unlock.
 | `train_detector.py` | Trains the detector from scratch |
 | `detect.py` | Runs the detector on images or recordings |
 | `detect_worker.py` | Detector helper process for the viewer's DETECT toggle |
-| `extract_frames.py` | Recordings to images + pre-filled labels for more training data |
+| `extract_frames.py` | Recordings to images (optionally with the model's guesses) for labelling |
+| `label_tool.py` | Local labelling page: draw pothole/crack boxes, saves in the training format |
 | `link_report.py` | Link quality versus distance for a recording |
 | `wifi_signal.swift` | Reads the Mac's Wi-Fi signal strength |
 
