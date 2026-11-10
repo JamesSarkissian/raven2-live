@@ -117,6 +117,23 @@ away when everything is ready or the motors unlock.
    only, in the training format). Images are never changed or deleted.
 4. `dataset/` is kept out of git (it holds GPS positions).
 
+## Retraining with your drone frames
+1. Build the mixed dataset (re-run after labelling more; it rebuilds from scratch):
+   `~/PotholeRecognitionModel/tf_env/bin/python build_drone_dataset.py`
+   It adds the images marked done to the original data in `~/Downloads/RoadDamageDrone`, split by
+   place (clips within 15 m stay together; clips with no GPS stay whole), prepared like the live
+   viewer (haze correction, square sections) and repeated twice in training. `test_drone/` holds
+   the held-out drone clips; `drone_split.json` lists which clip went where.
+2. Train, starting from the current model (about 9 min per epoch on an M4; Ctrl+C and the same
+   command resumes):
+   `caffeinate -i ~/PotholeRecognitionModel/tf_env/bin/python train_detector.py --data ~/Downloads/RoadDamageDrone --init models/road_damage/best.keras --out models/road_damage_drone --epochs 20 --lr 5e-4`
+   `report.txt` ends with the score on the held-out drone clips.
+3. Before/after on the same held-out clips:
+   `~/PotholeRecognitionModel/tf_env/bin/python evaluate_model.py --model models/road_damage/best.keras` (before)
+   and `--model models/road_damage_drone/best.keras` (after).
+4. Use the new model in the viewer: `RAVEN_MODEL=models/road_damage_drone/best.keras ./live_viewer.py`.
+   The old model stays in `models/road_damage/`.
+
 ## Files
 | File | Purpose |
 |---|---|
@@ -137,6 +154,8 @@ away when everything is ready or the motors unlock.
 | `detect.py` | Runs the detector on images or recordings |
 | `detect_worker.py` | Detector helper process for the viewer's DETECT toggle |
 | `extract_frames.py` | Recordings to images (optionally with the model's guesses) for labelling |
+| `build_drone_dataset.py` | Mixes labelled drone frames into the training data, split by place |
+| `evaluate_model.py` | Scores a model on a dataset split (before/after) |
 | `label_tool.py` | Local labelling page: draw pothole/crack boxes, saves in the training format |
 | `link_report.py` | Link quality versus distance for a recording |
 | `wifi_signal.swift` | Reads the Mac's Wi-Fi signal strength |

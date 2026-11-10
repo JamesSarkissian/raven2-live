@@ -10,6 +10,9 @@ Options:
   --out models/road_damage        where checkpoints and the model go
   --input 256                     image size the model sees (320 is sharper, ~1.5x slower)
   --limit N                       use only N training images (quick tests)
+  --init models/road_damage/best.keras
+                                  start from an already-trained model instead of
+                                  random weights (retraining with new drone data)
 Stop it any time with Ctrl+C; running it again resumes from the last epoch.
 
 Writes to --out:
@@ -17,7 +20,8 @@ Writes to --out:
   last.keras     model after the latest epoch (for resuming)
   state.json     epoch, best score, settings
   history.csv    loss and validation scores per epoch
-  report.txt     final test-set results
+  report.txt     final test-set results (and on test_drone/, the held-out drone
+                 clips, when the data has it: see build_drone_dataset.py)
 """
 import argparse
 import collections
@@ -208,6 +212,7 @@ def main():
     ap.add_argument("--eval-every", type=int, default=5)
     ap.add_argument("--input", type=int, default=dm.INPUT, help="image size the model sees")
     ap.add_argument("--limit", type=int, default=0, help="use only this many training images")
+    ap.add_argument("--init", help="start from this trained model instead of random weights")
     args = ap.parse_args()
     data = os.path.expanduser(args.data)
     os.makedirs(args.out, exist_ok=True)
@@ -233,6 +238,12 @@ def main():
         model = tf.keras.models.load_model(os.path.join(args.out, "last.keras"), compile=False)
         print("resuming after epoch %d (best validation mAP %.3f at epoch %d)" % (
             state["epoch"], state["best_map"], state["best_epoch"]), flush=True)
+    elif args.init:
+        model = tf.keras.models.load_model(os.path.expanduser(args.init), compile=False)
+        if int(model.input_shape[1]) != dm.INPUT:
+            sys.exit("%s was trained at --input %d; use that" % (args.init, model.input_shape[1]))
+        state["init"] = os.path.abspath(os.path.expanduser(args.init))
+        print("starting from %s (%.1f M parameters)" % (args.init, dm.param_count(model) / 1e6), flush=True)
     else:
         model = dm.build_model()
         print("new model, %.1f M parameters, random start (no pre-trained weights)" % (
@@ -273,6 +284,13 @@ def main():
              "mAP@0.3 %.3f | %s" % (dm.mean_ap(loose), score_line(loose)),
              "(P/R = precision/recall at score 0.3; @0.3 is a looser box match, fairer for long cracks)",
              "best epoch %d of %d" % (state["best_epoch"], state["epoch"])]
+    if os.path.exists(os.path.join(data, "test_drone", "_annotations.csv")) and not args.limit:
+        dtest = load_split(data, "test_drone")
+        pred = predict_split(model, dtest)
+        res, loose = dm.evaluate(*pred), dm.evaluate(*pred, iou_thr=0.3)
+        lines += ["", "Held-out drone clips (test_drone): %d sections" % len(dtest),
+                  "mAP@0.5 %.3f | %s" % (dm.mean_ap(res), score_line(res)),
+                  "mAP@0.3 %.3f | %s" % (dm.mean_ap(loose), score_line(loose))]
     print("\n" + "\n".join(lines))
     with open(os.path.join(args.out, "report.txt"), "w") as f:
         f.write("\n".join(lines) + "\n")
