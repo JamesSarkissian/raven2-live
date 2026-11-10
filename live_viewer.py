@@ -56,7 +56,13 @@ RECORDINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recording
 SHOTS = os.environ.get("RAVEN_SHOTS", os.path.join(HERE, "drone_screenshots"))   # SHOT button saves here
 # the detector needs TensorFlow, which lives in its own Python environment
 TF_PYTHON = os.environ.get("RAVEN_TF_PYTHON", os.path.expanduser("~/PotholeRecognitionModel/tf_env/bin/python"))
-MODEL = os.environ.get("RAVEN_MODEL", os.path.join(HERE, "models", "road_damage", "best.keras"))
+# the model retrained on the drone's own frames when it exists, else the original
+_DRONE_MODEL = os.path.join(HERE, "models", "road_damage_drone", "best.keras")
+MODEL = os.environ.get("RAVEN_MODEL") or (_DRONE_MODEL if os.path.exists(_DRONE_MODEL)
+                                          else os.path.join(HERE, "models", "road_damage", "best.keras"))
+# minimum confidence for a box: the drone-trained model gives real damage
+# lower scores on drone video, so it gets a lower cutoff
+THRESHOLD = float(os.environ.get("RAVEN_THRESHOLD") or (0.15 if "road_damage_drone" in MODEL else 0.25))
 
 
 class Camera(threading.Thread):
@@ -334,7 +340,7 @@ class LiveDetector(object):
         os.makedirs(os.path.join(HERE, ".build"), exist_ok=True)
         log = open(os.path.join(HERE, ".build", "detect_worker.log"), "ab")
         try:
-            proc = subprocess.Popen([TF_PYTHON, os.path.join(HERE, "detect_worker.py"), MODEL],
+            proc = subprocess.Popen([TF_PYTHON, os.path.join(HERE, "detect_worker.py"), MODEL, str(THRESHOLD)],
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
         except OSError as e:
             self.error, self.on = "could not start the detector: %s" % e, False
@@ -394,7 +400,8 @@ class LiveDetector(object):
             self.times.popleft()
         return {"on": self.on, "ready": self.ready, "error": self.error,
                 "dets": self.current(), "ms": r["ms"] if r and self.on else None,
-                "fps": round(len(self.times) / 2, 1) if self.ready else None}
+                "fps": round(len(self.times) / 2, 1) if self.ready else None,
+                "model": os.path.basename(os.path.dirname(MODEL)), "threshold": THRESHOLD}
 
 
 # ---- screenshots ---------------------------------------------------------------
@@ -846,7 +853,7 @@ function detRender(d){
   b.textContent=!d.on?'DETECT':!d.ready?'DETECT…':'DETECT'+(n('pothole')?' · '+n('pothole')+' pothole'+(n('pothole')>1?'s':''):'')+(n('crack')?' · '+n('crack')+' crack'+(n('crack')>1?'s':''):'');
   b.title=d.error?'Detection stopped: '+d.error+' · click to retry'
     :!d.on?'Live pothole and crack detection: off (D)'
-    :!d.ready?'Loading the model…':'Detection on · '+d.fps+' frames/s · '+d.ms+' ms per frame · click to turn off (D)';
+    :!d.ready?'Loading the model…':'Detection on · model '+d.model+' (cutoff '+d.threshold+') · '+d.fps+' frames/s · '+d.ms+' ms per frame · click to turn off (D)';
   renderBoxes();
 }
 async function detToggle(){
@@ -1084,6 +1091,7 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(cam))
     server.daemon_threads = True
     print("Viewer running: open http://localhost:%d  (Ctrl+C to stop)" % args.port)
+    print("Detection model: %s (cutoff %.2f)" % (os.path.relpath(MODEL, HERE), THRESHOLD))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -131,7 +131,10 @@ away when everything is ready or the motors unlock.
 3. Before/after on the same held-out clips:
    `~/PotholeRecognitionModel/tf_env/bin/python evaluate_model.py --model models/road_damage/best.keras` (before)
    and `--model models/road_damage_drone/best.keras` (after).
-4. Use the new model in the viewer: `RAVEN_MODEL=models/road_damage_drone/best.keras ./live_viewer.py`.
+4. The viewer's DETECT uses `models/road_damage_drone/best.keras` whenever it exists (cutoff 0.15,
+   since it scores real damage lower on drone video), else the original model (cutoff 0.25). The
+   DETECT tooltip and the startup message show which. Override with
+   `RAVEN_MODEL=models/road_damage/best.keras` and/or `RAVEN_THRESHOLD=0.25`.
    The old model stays in `models/road_damage/`.
 
 ## Files
