@@ -102,6 +102,8 @@ away when everything is ready or the motors unlock.
 - **REC** (or `R`): records the camera video, flight data and GPS path to `recordings/<time>/`
   (it also starts by itself when the motors unlock). If DETECT is on while recording, every box the
   model finds is saved too, in `detections.csv` with time and GPS position, and REC shows the count.
+  The video itself stays clean (good for training); the **Recordings** page draws the saved boxes on
+  playback, with a **Boxes on/off** button (or `B`). The list shows how many boxes each recording has.
 
 ## Collecting more training data
 1. Record potholes and cracks with REC (flying, or holding the drone with the motors locked).

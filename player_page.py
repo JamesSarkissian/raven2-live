@@ -29,6 +29,9 @@ main{display:flex;flex-direction:column;min-width:0;overflow:auto}
 #videoBox{aspect-ratio:16/9;min-height:0}
 #frame:not([src]){visibility:hidden}
 #frame{width:100%;height:100%;object-fit:contain;display:block}
+#boxes{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+#boxbtn:disabled{opacity:.45;cursor:default}
+.rec .m .dt{color:#ffb4b4}
 #gap{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.65);color:var(--dim);padding:6px 10px;border-radius:6px;font-size:12px}
 #chip{position:absolute;top:8px;left:8px;font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;border-radius:4px;padding:1px 6px;background:#2a3340;color:var(--dim)}
 #chip.armed{background:var(--bad);color:#fff}#chip.landing{background:var(--warn);color:#111}
@@ -59,7 +62,7 @@ button.on{background:#24415a;border-color:var(--acc)}
   <aside id=list><div class=empty>Loading…</div></aside>
   <main>
     <div id=stage>
-      <div id=videoBox><img id=frame alt="Recorded drone camera"><div id=gap hidden>No video here (signal gap)</div><span id=chip hidden></span></div>
+      <div id=videoBox><img id=frame alt="Recorded drone camera"><canvas id=boxes></canvas><div id=gap hidden>No video here (signal gap)</div><span id=chip hidden></span></div>
       <div id=mapBox><div id=lmap></div><div id=mapnote hidden></div>
         <div id=mapctl><button id=sat class=on>Satellite</button><button id=street>Streets</button><button id=follow class=on title="Keep the drone in view">Follow</button><a class=btn id=gmaps target=_blank rel=noopener>Google Maps</a></div></div>
     </div>
@@ -70,6 +73,7 @@ button.on{background:#24415a;border-color:var(--acc)}
       <span id=time>0:00 / 0:00</span>
       <select id=speed aria-label="Playback speed"><option value=.5>0.5×</option><option value=1 selected>1×</option><option value=2>2×</option><option value=4>4×</option></select>
       <button id=units>ft</button>
+      <button id=boxbtn title="Show the pothole and crack boxes saved while DETECT was on (B)">Boxes</button>
       <a class=btn id=kml>KML</a><a class=btn id=geo>GeoJSON</a>
     </div>
   </main>
@@ -96,6 +100,8 @@ async function loadList(){
     el.innerHTML='<div class=d></div><div class=m></div>';
     el.children[0].textContent=d.toLocaleDateString(undefined,{weekday:'short',month:'short',day:'numeric'})+', '+d.toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'});
     el.children[1].textContent=[x.duration!=null?fmtT(x.duration):'recording…',x.length_m!=null?(imperial?Math.round(x.length_m*3.28084)+' ft':Math.round(x.length_m)+' m'):null,x.mb+' MB'].filter(Boolean).join(' · ');
+    const dc=x.detections||{}, dn=[dc.pothole&&dc.pothole+' pothole box'+(dc.pothole>1?'es':''),dc.crack&&dc.crack+' crack box'+(dc.crack>1?'es':'')].filter(Boolean);
+    if(dn.length){const s=document.createElement('div');s.className='m dt';s.textContent=dn.join(' · ');el.appendChild(s);}
     el.onclick=()=>open_(x.name);
     list.appendChild(el);
   }
@@ -113,7 +119,7 @@ async function open_(name){
   t0=Math.min(...starts); T=Math.max(...ends)-t0; cur=0; shownFrame=-1;
   D.col={}; D.fields.forEach((f,i)=>D.col[f]=i+1);
   $('kml').href='/rec/'+name+'/track.kml'; $('geo').href='/rec/'+name+'/track.geojson';
-  mapLoad(); render();
+  boxRender(); mapLoad(); render();
 }
 // last index with arr[i] <= x (arr sorted), using key(i)
 function idxAt(n,key,x){let lo=0,hi=n-1,a=-1;while(lo<=hi){const m=(lo+hi)>>1;if(key(m)<=x){a=m;lo=m+1}else hi=m-1}return a;}
@@ -122,7 +128,7 @@ function row(){if(!D||!D.rows.length)return null;const i=idxAt(D.rows.length,i=>
 function showFrame(i){
   wantFrame=i; if(loading||i===shownFrame||i<0)return;
   loading=true; const img=new Image(), n=i;
-  img.onload=img.onerror=()=>{loading=false;if(img.complete&&img.naturalWidth){$('frame').src=img.src;shownFrame=n;}if(wantFrame!==shownFrame)showFrame(wantFrame);};
+  img.onload=img.onerror=()=>{loading=false;if(img.complete&&img.naturalWidth){$('frame').src=img.src;shownFrame=n;drawBoxes();}if(wantFrame!==shownFrame)showFrame(wantFrame);};
   img.src='/rec/'+rec+'/frame/'+n+'.jpg';
 }
 function render(){
@@ -144,6 +150,37 @@ function render(){
   $('gmaps').href=fix?'https://www.google.com/maps/search/?api=1&query='+r.lat+','+r.lon:'https://www.google.com/maps';
   mapUpdate(fix?[r.lat,r.lon]:null,hdg);
 }
+// ---- saved detection boxes (DETECT was on while recording) -------------------
+let showBoxes=true; try{showBoxes=localStorage.getItem('boxes')!=='off'}catch(e){}
+const BOXC={pothole:'#ff4d4d',crack:'#ffd23f'};
+function boxRender(){
+  const has=!!(D&&D.dets&&D.dets.length), b=$('boxbtn');
+  b.disabled=!has; b.classList.toggle('on',has&&showBoxes);
+  b.textContent=has?(showBoxes?'Boxes on':'Boxes off'):'No boxes';
+  b.title=has?'Pothole and crack boxes saved while DETECT was on · click to '+(showBoxes?'hide':'show')+' (B)'
+             :'No boxes saved: DETECT was off while this was recorded';
+  drawBoxes();
+}
+function drawBoxes(){
+  const c=$('boxes'), f=$('frame'), r=c.getBoundingClientRect(), k=devicePixelRatio||1;
+  c.width=Math.round(r.width*k); c.height=Math.round(r.height*k);
+  const g=c.getContext('2d'); g.clearRect(0,0,c.width,c.height);
+  if(!showBoxes||!D||!D.dets||!D.dets.length||shownFrame<0||!f.naturalWidth)return;
+  // the result for the frame on screen: the model ran on most frames, not all
+  const ft=D.frames[shownFrame], i=idxAt(D.dets.length,j=>D.dets[j][0],ft+0.01);
+  if(i<0||ft-D.dets[i][0]>0.3)return;
+  // where the picture sits inside the box (object-fit: contain)
+  const s=Math.min(c.width/f.naturalWidth,c.height/f.naturalHeight), w=f.naturalWidth*s, h=f.naturalHeight*s, ox=(c.width-w)/2, oy=(c.height-h)/2;
+  g.lineWidth=2*k; g.font='600 '+11*k+'px system-ui';
+  for(const[cls,score,x0,y0,x1,y1]of D.dets[i][1]){
+    const col=BOXC[cls]||'#fff', X=ox+x0*w, Y=oy+y0*h;
+    g.strokeStyle=col; g.strokeRect(X,Y,(x1-x0)*w,(y1-y0)*h);
+    const t=cls+' '+Math.round(score*100)+'%', tw=g.measureText(t).width+6*k;
+    g.fillStyle=col; g.fillRect(X,Math.max(0,Y-15*k),tw,15*k); g.fillStyle='#111'; g.fillText(t,X+3*k,Math.max(0,Y-15*k)+11.5*k);
+  }
+}
+$('boxbtn').onclick=()=>{showBoxes=!showBoxes;try{localStorage.setItem('boxes',showBoxes?'on':'off')}catch(e){}boxRender();};
+window.addEventListener('resize',drawBoxes);
 // ---- playback ---------------------------------------------------------------
 let last=0, seeking=false;
 function tick(now){if(!playing)return;cur+=(now-last)/1000*speed;last=now;if(cur>=T){cur=T;pause();}render();requestAnimationFrame(tick);}
@@ -157,6 +194,7 @@ $('units').textContent=imperial?'m':'ft';
 $('units').onclick=()=>{imperial=!imperial;$('units').textContent=imperial?'m':'ft';try{localStorage.setItem('units',imperial?'ft':'m')}catch(e){}render();};
 document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'&&e.target.type!=='range')return;
   if(e.key===' '){e.preventDefault();playing?pause():play();}
+  if((e.key==='b'||e.key==='B')&&!$('boxbtn').disabled)$('boxbtn').click();
   if(e.key==='ArrowRight'){cur=Math.min(T,cur+5);render();} if(e.key==='ArrowLeft'){cur=Math.max(0,cur-5);render();}});
 // ---- map: satellite/streets with internet, plain path without ---------------
 let map=null, layers={}, full=null, done=null, home=null, drone=null, follow=true, fallback=!window.L;

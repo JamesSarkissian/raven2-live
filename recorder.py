@@ -413,7 +413,7 @@ def list_recordings(root):
                     "duration": round(meta["stop"] - start, 1) if meta.get("stop") else None,
                     "frames": meta.get("frames"), "length_m": meta.get("track_length_m"),
                     "mb": round(os.path.getsize(os.path.join(folder, "video.mjpg")) / 1e6, 1),
-                    "complete": bool(meta)})
+                    "complete": bool(meta), "detections": meta.get("detections") or {}})
     return out
 
 
@@ -442,7 +442,23 @@ def recording_data(folder, max_rate=10.0):
                 elif feat["properties"].get("name") == "Home":
                     home = [g["coordinates"][1], g["coordinates"][0]]
     return {"name": os.path.basename(folder), "frames": frames, "fields": fields,
-            "rows": rows, "track": track, "home": home}
+            "rows": rows, "track": track, "home": home, "dets": recording_detections(folder)}
+
+
+def recording_detections(folder):
+    """Boxes saved while DETECT was on: [[frame_t, [[class, score, x0, y0, x1, y1], ...]], ...]
+    sorted by frame time, corners as fractions of the frame. Empty if DETECT was off."""
+    path = os.path.join(folder, "detections.csv")
+    by = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            for r in csv.DictReader(f):
+                try:
+                    by.setdefault(float(r["frame_t"]), []).append(
+                        [r["class"], float(r["score"])] + [float(r[k]) for k in ("x0", "y0", "x1", "y1")])
+                except (KeyError, ValueError):
+                    continue    # a row cut short by a crash
+    return [[t, by[t]] for t in sorted(by)]
 
 
 _index_cache = {}
