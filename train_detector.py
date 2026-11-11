@@ -2,7 +2,7 @@
 """Train the road-damage detector (potholes and cracks) from scratch.
 
 Run it with the TensorFlow environment:
-  ~/PotholeRecognitionModel/tf_env/bin/python train_detector.py
+  .venv/bin/python train_detector.py
 
 Options:
   --data ~/Downloads/RoadDamage   merged dataset from build_dataset.py

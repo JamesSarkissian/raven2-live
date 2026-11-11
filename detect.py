@@ -7,8 +7,8 @@ As a module (the viewer uses this):
     for cls, score, x0, y0, x1, y1 in det.detect_jpeg(jpeg_bytes): ...
 
 From the command line (TensorFlow environment):
-    ~/PotholeRecognitionModel/tf_env/bin/python detect.py IMAGE_OR_FOLDER... [--out results/]
-    ~/PotholeRecognitionModel/tf_env/bin/python detect.py recordings/<name> --out results/ --drone
+    .venv/bin/python detect.py IMAGE_OR_FOLDER... [--out results/]
+    .venv/bin/python detect.py recordings/<name> --out results/ --drone
 --drone adds the haze/glare correction and square sections used for the
 drone's own camera (detect_worker.py does the same for the live viewer).
 Writes copies of the images with boxes drawn (red = pothole, yellow = crack)

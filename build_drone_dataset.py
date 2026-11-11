@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mix your labelled drone frames into the training data for retraining.
 
-    ~/PotholeRecognitionModel/tf_env/bin/python build_drone_dataset.py
+    .venv/bin/python build_drone_dataset.py
         [--base ~/Downloads/RoadDamage] [--drone dataset/drone] [--out ~/Downloads/RoadDamageDrone]
 
 Takes the images you marked "done" in label_tool.py and:

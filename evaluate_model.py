@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Score a trained model on one part of a dataset (the "before" number).
 
-    ~/PotholeRecognitionModel/tf_env/bin/python evaluate_model.py
+    .venv/bin/python evaluate_model.py
         [--model models/road_damage/best.keras] [--data ~/Downloads/RoadDamageDrone] [--split test_drone]
 
 Prints the same scores as the end of training: AP per class and mAP, with

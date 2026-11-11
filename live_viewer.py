@@ -55,7 +55,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RECORDINGS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recordings")
 SHOTS = os.environ.get("RAVEN_SHOTS", os.path.join(HERE, "drone_screenshots"))   # SHOT button saves here
 # the detector needs TensorFlow, which lives in its own Python environment
-TF_PYTHON = os.environ.get("RAVEN_TF_PYTHON", os.path.expanduser("~/PotholeRecognitionModel/tf_env/bin/python"))
+# RAVEN_TF_PYTHON, else a .venv in this folder (see README), else an older shared environment
+TF_PYTHON = os.environ.get("RAVEN_TF_PYTHON") or next(
+    (p for p in (os.path.join(HERE, ".venv", "bin", "python"),
+                 os.path.expanduser("~/PotholeRecognitionModel/tf_env/bin/python")) if os.path.exists(p)),
+    os.path.join(HERE, ".venv", "bin", "python"))
 # the model retrained on the drone's own frames when it exists, else the original
 _DRONE_MODEL = os.path.join(HERE, "models", "road_damage_drone", "best.keras")
 MODEL = os.environ.get("RAVEN_MODEL") or (_DRONE_MODEL if os.path.exists(_DRONE_MODEL)

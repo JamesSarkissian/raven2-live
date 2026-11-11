@@ -22,3 +22,6 @@ models/
 drone_screenshots/
 screenshots/
 dataset/
+
+# Python environment for the detector
+.venv
